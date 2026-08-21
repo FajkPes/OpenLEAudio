@@ -1,0 +1,18 @@
+# Reproducible build output
+dev/**/bin/
+dev/**/obj/
+dev/core/target/
+dev/build/
+dev/artifacts/
+dev/captures/*backup.json
+
+# Machine-local rollback state and optional downloaded installers
+release/runtime-data/*.json
+release/dependencies/*.exe
+release/dependencies/*.zip
+release/dependencies/VB-CABLE/
+
+# Upload this as a GitHub Release asset instead of committing it
+OpenLEAudio-*-win-x64.zip
+dev/.claude/
+dev/captures/

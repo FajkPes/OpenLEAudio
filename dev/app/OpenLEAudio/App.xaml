@@ -1,0 +1,50 @@
+<Application
+    x:Class="OpenLEAudio.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+            </ResourceDictionary.MergedDictionaries>
+            <ResourceDictionary.ThemeDictionaries>
+                <ResourceDictionary x:Key="Dark">
+                    <SolidColorBrush x:Key="ComboBoxDropDownBackground" Color="#FF2B2B2B" />
+                    <SolidColorBrush x:Key="ComboBoxDropDownBorderBrush" Color="#FF575757" />
+                    <SolidColorBrush x:Key="CardBackgroundFillColorDefaultBrush" Color="#FF2B2B2B" />
+                    <SolidColorBrush x:Key="CardBackgroundFillColorSecondaryBrush" Color="#FF252525" />
+                    <SolidColorBrush x:Key="CardStrokeColorDefaultBrush" Color="#FF3F3F3F" />
+                    <SolidColorBrush x:Key="TextFillColorSecondaryBrush" Color="#C5FFFFFF" />
+                    <SolidColorBrush x:Key="TextFillColorTertiaryBrush" Color="#8BFFFFFF" />
+                    <SolidColorBrush x:Key="AccentFillColorDefaultBrush" Color="#FF60CDFF" />
+                    <SolidColorBrush x:Key="AccentTextFillColorPrimaryBrush" Color="#FF60CDFF" />
+                    <SolidColorBrush x:Key="TextOnAccentFillColorPrimaryBrush" Color="#FF000000" />
+                </ResourceDictionary>
+                <ResourceDictionary x:Key="Light">
+                    <SolidColorBrush x:Key="ComboBoxDropDownBackground" Color="#FFFFFFFF" />
+                    <SolidColorBrush x:Key="ComboBoxDropDownBorderBrush" Color="#FFD0D0D0" />
+                    <SolidColorBrush x:Key="CardBackgroundFillColorDefaultBrush" Color="#B3FFFFFF" />
+                    <SolidColorBrush x:Key="CardBackgroundFillColorSecondaryBrush" Color="#80FFFFFF" />
+                    <SolidColorBrush x:Key="CardStrokeColorDefaultBrush" Color="#14000000" />
+                    <SolidColorBrush x:Key="TextFillColorSecondaryBrush" Color="#9E000000" />
+                    <SolidColorBrush x:Key="TextFillColorTertiaryBrush" Color="#72000000" />
+                    <SolidColorBrush x:Key="AccentFillColorDefaultBrush" Color="#FF0067C0" />
+                    <SolidColorBrush x:Key="AccentTextFillColorPrimaryBrush" Color="#FF005FB8" />
+                    <SolidColorBrush x:Key="TextOnAccentFillColorPrimaryBrush" Color="#FFFFFFFF" />
+                </ResourceDictionary>
+                <ResourceDictionary x:Key="HighContrast">
+                    <SolidColorBrush x:Key="ComboBoxDropDownBackground" Color="{ThemeResource SystemColorWindowColor}" />
+                    <SolidColorBrush x:Key="ComboBoxDropDownBorderBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+                    <SolidColorBrush x:Key="CardBackgroundFillColorDefaultBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                    <SolidColorBrush x:Key="CardBackgroundFillColorSecondaryBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                    <SolidColorBrush x:Key="CardStrokeColorDefaultBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+                    <SolidColorBrush x:Key="TextFillColorSecondaryBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+                    <SolidColorBrush x:Key="TextFillColorTertiaryBrush" Color="{ThemeResource SystemColorGrayTextColor}" />
+                    <SolidColorBrush x:Key="AccentFillColorDefaultBrush" Color="{ThemeResource SystemColorHighlightColor}" />
+                    <SolidColorBrush x:Key="AccentTextFillColorPrimaryBrush" Color="{ThemeResource SystemColorHotlightColor}" />
+                    <SolidColorBrush x:Key="TextOnAccentFillColorPrimaryBrush" Color="{ThemeResource SystemColorHighlightTextColor}" />
+                </ResourceDictionary>
+            </ResourceDictionary.ThemeDictionaries>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

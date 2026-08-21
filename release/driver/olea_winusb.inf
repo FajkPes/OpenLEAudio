@@ -1,0 +1,64 @@
+;
+; olea_winusb.inf - binds WinUSB to a Bluetooth controller so the OpenLEAudio
+; user-mode stack can drive it directly over HCI.
+;
+; No kernel code of ours is involved. WinUSB.sys ships with Windows and is signed
+; by Microsoft, so Secure Boot stays on and driver signature enforcement is never
+; weakened. Only this INF needs a signature, and a self-signed certificate placed
+; in Trusted Publishers is enough for that.
+;
+; DELIBERATELY NOT GENERIC. Matching on the Bluetooth device class
+; (USB\Class_E0&SubClass_01&Prot_01) would claim every Bluetooth controller in the
+; machine and leave the user with no working Bluetooth at all. Each adapter must be
+; opted in by hardware ID, and installed against one device instance.
+;
+; To undo: Device Manager -> the adapter -> Update driver -> pick the original,
+; or run scripts/uninstall.ps1, which restores the recorded previous binding.
+;
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = USBDevice
+ClassGuid   = {88BAE032-5A81-49F0-BC3D-A4FF138216D6}
+Provider    = %ProviderName%
+CatalogFile = olea_winusb.cat
+DriverVer   = 01/01/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ProviderName% = OpenLeAudio, NTamd64.10.0...17763
+
+; ---------------------------------------------------------------------------
+; Supported adapters. Add a line per adapter you want the stack to drive.
+; ASUS USB-BT600 (Realtek) is the reference device this was developed against.
+; ---------------------------------------------------------------------------
+[OpenLeAudio.NTamd64.10.0...17763]
+%Device.BT600% = WinUsbInstall, USB\VID_0B05&PID_1D70
+
+[WinUsbInstall.NT]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[WinUsbInstall.NT.Services]
+Include = winusb.inf
+Needs   = WINUSB.NT.Services
+
+[WinUsbInstall.NT.Wdf]
+KmdfService = WINUSB, WinUsb_Install
+
+[WinUsb_Install]
+KmdfLibraryVersion = 1.11
+
+;
+; The device interface GUID the stack opens. Generated for this project; do not
+; reuse it elsewhere, or two applications will fight over the same adapter.
+;
+[WinUsbInstall.NT.HW]
+AddReg = WinUsbDeviceInterfaceGuid
+
+[WinUsbDeviceInterfaceGuid]
+HKR,,DeviceInterfaceGUIDs,0x00010000,"{B7C4E0A1-3F62-4D18-9E5B-2A8F6C1D4E70}"
+
+[Strings]
+ProviderName  = "OpenLEAudio"
+Device.BT600  = "OpenLEAudio Bluetooth Controller (WinUSB)"

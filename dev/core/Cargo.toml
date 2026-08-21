@@ -1,0 +1,89 @@
+[package]
+name = "olea-core"
+version = "0.9.0-beta"
+edition = "2021"
+description = "User-mode Bluetooth LE Audio host stack with full control over LC3 stream configuration"
+
+[dependencies]
+# Pure-Rust USB access. Talks to WinUSB on Windows, so no libusb DLL to ship
+# and no kernel code of ours anywhere in the path.
+nusb = "0.1"
+futures-lite = "2"
+thiserror = "2"
+
+# The configuration app is a separate process and speaks JSON over a pipe, so
+# the protocol between them needs a parser both sides agree on exactly.
+serde_json = "1"
+tracing = "0.1"
+
+# Pure-Rust LC3 encoder, so the bitrate is genuinely ours to choose and there is
+# no C library to build or ship.
+lc3-codec = "0.2"
+
+# LE Secure Connections pairing: P-256 key agreement plus AES-CMAC for the
+# f4/f5/f6 key derivation functions. Audited crates rather than hand-rolled
+# crypto, because getting this subtly wrong is how links silently stop being
+# encrypted.
+p256 = { version = "0.13", features = ["ecdh"] }
+aes = "0.8"
+cmac = "0.7"
+rand = "0.8"
+
+# Isochronous transfers are how LE Audio carries sound, and nusb does not expose
+# them on Windows - so those pipes are driven through WinUSB directly.
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Devices_Usb",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Media_KernelStreaming",
+    "Win32_UI_Shell_PropertiesSystem",
+]
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
+
+[[bin]]
+name = "olea-captest"
+path = "src/bin/captest.rs"
+
+[[bin]]
+name = "OpenLEAudio_Client"
+path = "src/bin/agent.rs"
+
+[[bin]]
+name = "olea-probe"
+path = "src/bin/probe.rs"
+
+[[bin]]
+name = "olea-connect"
+path = "src/bin/connect.rs"
+
+[[bin]]
+name = "olea-usbinfo"
+path = "src/bin/usbinfo.rs"
+
+[[bin]]
+name = "olea-hcitest"
+path = "src/bin/hcitest.rs"
+
+# P-256 point multiplication and LC3 encoding are both far too slow when built
+# without optimisation - slow enough that pairing lost a real handshake to the
+# peer's 30-second SMP timeout while the public key was still being computed.
+# Dependencies are optimised even in a debug build; our own code stays
+# unoptimised so panics and backtraces remain useful.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1

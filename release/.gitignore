@@ -1,0 +1,7 @@
+# Downloaded Microsoft installers are optional cache/offline payloads.
+dependencies/*.exe
+dependencies/*.zip
+dependencies/VB-CABLE/
+
+# Machine-specific rollback state; scripts create it locally.
+runtime-data/*.json

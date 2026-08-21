@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>OpenLEAudio</RootNamespace>
+    <Version>0.9.0-beta</Version>
+    <AssemblyVersion>0.9.0.0</AssemblyVersion>
+    <FileVersion>0.9.0.0</FileVersion>
+    <InformationalVersion>0.9 Beta</InformationalVersion>
+    <Product>OpenLEAudio 0.9 Beta</Product>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <UseWinUI>true</UseWinUI>
+    <Nullable>enable</Nullable>
+
+    <!-- Unpackaged and framework-dependent on purpose. The launcher checks and
+         installs both Microsoft runtimes before starting this executable. -->
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>false</WindowsAppSDKSelfContained>
+    <SelfContained>false</SelfContained>
+    <!-- The application itself ships English and Czech. Framework satellite
+         assemblies for every other locale only duplicate fallback error text. -->
+    <SatelliteResourceLanguages>en;cs</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>None</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.WindowsDesktop.App.WindowsForms" />
+    <!-- Only WinUI and the runtime declaration are needed. Referencing the
+         umbrella package publishes optional AI, ML, and WebView projections
+         that OpenLEAudio does not use. -->
+    <PackageReference Include="Microsoft.WindowsAppSDK.WinUI" Version="1.8.260803003" />
+    <PackageReference Include="Microsoft.WindowsAppSDK.Runtime" Version="1.8.260804001" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.4654" />
+  </ItemGroup>
+
+  <!-- WinUI compiles MainWindow.xaml into this PRI file. The unpackaged
+       framework-dependent publish target does not always copy it, and the app
+       then fails before the first window can be shown. Make it mandatory. -->
+  <Target Name="CopyWinUiPriToPublish" AfterTargets="Publish">
+    <Error Condition="!Exists('$(TargetDir)$(AssemblyName).pri')"
+           Text="The WinUI resource index $(AssemblyName).pri was not generated." />
+    <Copy SourceFiles="$(TargetDir)$(AssemblyName).pri"
+          DestinationFiles="$(PublishDir)$(AssemblyName).pri" />
+  </Target>
+
+</Project>
