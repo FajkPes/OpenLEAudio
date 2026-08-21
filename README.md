@@ -16,4 +16,5 @@ Read [release/README.md](release/README.md) for installation and safety instruct
 
 Version 0.9 Beta is experimental. Use a dedicated USB Bluetooth adapter, keep a Windows-stack adapter available when possible, and use the included restore tool if you need to return the selected adapter to the Windows driver.
 
-Made by FajkPes with a massive help from Claude Code and ChatGPT Codex.
+-----------------------------------------------------------------------------
+- Made by FajkPes with a massive help from Claude Code and ChatGPT Code, 2026
