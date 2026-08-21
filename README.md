@@ -1,6 +1,7 @@
 # OpenLEAudio
 
 OpenLEAudio is an experimental, configurable user-mode Bluetooth LE Audio stack for Windows. It takes control of one selected USB Bluetooth adapter through WinUSB while a second adapter can remain on the normal Windows Bluetooth stack.
+Tested for JBL TUNE 780NC LE Audio
 
 The project is organized so end users do not need to download development files:
 
