@@ -1,6 +1,14 @@
-# Reproducible build output
-dev/**/bin/
-dev/**/obj/
+# Reproducible build output.
+#
+# Scoped to the application project rather than written as dev/**/bin/. That
+# pattern also matched dev/core/src/bin/, which is not build output at all - it
+# is where every Rust binary lives, including the agent that owns the radio. The
+# whole of it was therefore missing from the repository, so a fresh clone could
+# not build the program and nothing said why.
+dev/app/**/bin/
+dev/app/**/obj/
+dev/tools/**/bin/
+dev/tools/**/obj/
 dev/core/target/
 dev/build/
 dev/artifacts/
@@ -12,7 +20,12 @@ release/dependencies/*.exe
 release/dependencies/*.zip
 release/dependencies/VB-CABLE/
 
-# Upload this as a GitHub Release asset instead of committing it
+# Upload this as a GitHub Release asset instead of committing it. The whole
+# ready-to-run package is already in release/, so a copy of it in the repository
+# root is both duplicated and, once a version has moved on, actively misleading:
+# somebody downloading the stale zip gets old binaries from a repository whose
+# source has changed underneath them.
 OpenLEAudio-*-win-x64.zip
+OpenLEAudio-*.zip
 dev/.claude/
 dev/captures/

@@ -1,6 +1,6 @@
 [package]
 name = "olea-core"
-version = "0.9.0-beta"
+version = "1.0.0"
 edition = "2021"
 description = "User-mode Bluetooth LE Audio host stack with full control over LC3 stream configuration"
 

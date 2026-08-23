@@ -53,6 +53,7 @@ pub mod op {
     pub const LE_CREATE_CIS: u16 = opcode(ogf::LE_CONTROLLER, 0x0064);
     pub const LE_REMOVE_CIG: u16 = opcode(ogf::LE_CONTROLLER, 0x0065);
     pub const LE_SETUP_ISO_DATA_PATH: u16 = opcode(ogf::LE_CONTROLLER, 0x006E);
+    pub const LE_READ_ISO_LINK_QUALITY: u16 = opcode(ogf::LE_CONTROLLER, 0x0075);
 }
 
 /// Event codes.
@@ -268,6 +269,75 @@ pub fn read_rssi(handle: u16) -> Vec<u8> {
     command(op::READ_RSSI, &handle.to_le_bytes())
 }
 
+/// Asks the controller how one isochronous channel is actually doing.
+///
+/// This is the only honest source of packet loss on a CIS. Counting our own
+/// failed USB submissions says whether the audio left this PC, which it almost
+/// always did; it says nothing at all about whether the headphones heard it.
+/// Everything that happens on the air - a packet that needed retransmitting, a
+/// subevent that went unacknowledged, one flushed because its deadline passed -
+/// is visible here and nowhere else.
+pub fn le_read_iso_link_quality(cis_handle: u16) -> Vec<u8> {
+    command(op::LE_READ_ISO_LINK_QUALITY, &cis_handle.to_le_bytes())
+}
+
+/// What the controller knows about one isochronous channel.
+///
+/// Counters are cumulative since the channel was established, so a rate is the
+/// difference between two readings rather than any single one of them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IsoLinkQuality {
+    pub handle: u16,
+    /// Packets sent whose acknowledgement never arrived. On a stream flowing
+    /// from here to the headphones, this is the count that means "not heard".
+    pub tx_unacked_packets: u32,
+    /// Packets dropped because their transport latency deadline passed before
+    /// they could be sent. Audio that was never given a chance to arrive.
+    pub tx_flushed_packets: u32,
+    /// Packets that had to be sent more than once. Not loss - this is the
+    /// retransmission budget doing its job - but a rising number is the early
+    /// warning that the budget is about to run out.
+    pub retransmitted_packets: u32,
+    pub tx_last_subevent_packets: u32,
+    /// Received packets that failed their CRC, on the microphone direction.
+    pub crc_error_packets: u32,
+    /// Receive slots where nothing arrived at all.
+    pub rx_unreceived_packets: u32,
+    pub duplicate_packets: u32,
+}
+
+impl IsoLinkQuality {
+    /// Packets the headphones can be assumed not to have played.
+    pub fn lost_packets(&self) -> u64 {
+        self.tx_unacked_packets as u64 + self.tx_flushed_packets as u64
+    }
+}
+
+/// Reads the return parameters of LE Read ISO Link Quality.
+///
+/// Layout: status(1) connection_handle(2) then seven 32-bit counters.
+pub fn parse_iso_link_quality(params: &[u8]) -> Option<IsoLinkQuality> {
+    if params.len() < 3 + 7 * 4 || params[0] != 0x00 {
+        return None;
+    }
+
+    let word = |index: usize| {
+        let at = 3 + index * 4;
+        u32::from_le_bytes([params[at], params[at + 1], params[at + 2], params[at + 3]])
+    };
+
+    Some(IsoLinkQuality {
+        handle: u16::from_le_bytes([params[1], params[2]]),
+        tx_unacked_packets: word(0),
+        tx_flushed_packets: word(1),
+        tx_last_subevent_packets: word(2),
+        retransmitted_packets: word(3),
+        crc_error_packets: word(4),
+        rx_unreceived_packets: word(5),
+        duplicate_packets: word(6),
+    })
+}
+
 /// Unmasks every event the controller can raise, so nothing is missed.
 pub fn set_event_mask() -> Vec<u8> {
     command(op::SET_EVENT_MASK, &[0xFF; 8])
@@ -351,7 +421,11 @@ pub fn le_set_extended_scan_enable(enable: bool, filter_duplicates: bool) -> Vec
 /// The connection interval asked for here is only an opening position; the
 /// peripheral usually proposes its own preference straight afterwards, and for
 /// audio the interval that matters is the CIG one anyway.
-pub fn le_create_connection(peer: BdAddr, peer_address_type: u8) -> Vec<u8> {
+pub fn le_create_connection(
+    peer: BdAddr,
+    peer_address_type: u8,
+    supervision_timeout: u16,
+) -> Vec<u8> {
     let mut params = Vec::with_capacity(25);
 
     params.extend_from_slice(&0x0060u16.to_le_bytes()); // scan interval 60 ms
@@ -363,11 +437,54 @@ pub fn le_create_connection(peer: BdAddr, peer_address_type: u8) -> Vec<u8> {
     params.extend_from_slice(&0x0018u16.to_le_bytes()); // interval min 30 ms
     params.extend_from_slice(&0x0028u16.to_le_bytes()); // interval max 50 ms
     params.extend_from_slice(&0x0000u16.to_le_bytes()); // latency
-    params.extend_from_slice(&0x01F4u16.to_le_bytes()); // supervision timeout 5 s
+    params.extend_from_slice(&clamp_supervision(supervision_timeout).to_le_bytes());
     params.extend_from_slice(&0x0000u16.to_le_bytes()); // min CE length
     params.extend_from_slice(&0x0000u16.to_le_bytes()); // max CE length
 
     command(op::LE_CREATE_CONNECTION, &params)
+}
+
+/// Builds LE Connection Update: new interval, peripheral latency and timeout.
+///
+/// Audio does not travel on the ACL - it has its own isochronous channels - so
+/// once the stream is configured the ACL carries almost nothing: a volume
+/// notification when somebody touches the earcup, a battery level now and then.
+/// It still costs both radios a connection event every interval, and peripheral
+/// latency is the specification's own answer: the headphones may skip up to that
+/// many events when they have nothing to say, and wake for the next one when
+/// they do. Nothing is lost, because anything we send still arrives at the very
+/// next event.
+///
+/// The supervision timeout has to stay longer than `interval_max * (latency + 1)`
+/// or the link declares itself dead in normal operation; the caller is expected
+/// to have clamped it.
+pub fn le_connection_update(
+    handle: u16,
+    interval_min: u16,
+    interval_max: u16,
+    latency: u16,
+    supervision_timeout: u16,
+) -> Vec<u8> {
+    let mut params = Vec::with_capacity(14);
+    params.extend_from_slice(&handle.to_le_bytes());
+    params.extend_from_slice(&interval_min.to_le_bytes());
+    params.extend_from_slice(&interval_max.to_le_bytes());
+    params.extend_from_slice(&latency.to_le_bytes());
+    params.extend_from_slice(&clamp_supervision(supervision_timeout).to_le_bytes());
+    params.extend_from_slice(&0x0000u16.to_le_bytes()); // min CE length
+    params.extend_from_slice(&0x0000u16.to_le_bytes()); // max CE length
+
+    command(op::LE_CONNECTION_UPDATE, &params)
+}
+
+/// Keeps a supervision timeout inside what the specification allows.
+///
+/// Units of 10 ms, from 100 ms to 32 s. Also enforced against the connection
+/// interval: the timeout must exceed twice the maximum interval, and a
+/// controller answers an impossible pair with "invalid HCI parameters" rather
+/// than with anything that names the offending number.
+pub fn clamp_supervision(timeout: u16) -> u16 {
+    timeout.clamp(0x0064, 0x0C80)
 }
 
 /// Builds LE Extended Create Connection on the 1M PHY.
@@ -376,7 +493,11 @@ pub fn le_create_connection(peer: BdAddr, peer_address_type: u8) -> Vec<u8> {
 /// been used; mixing the two generations is what the specification allows a
 /// controller to refuse outright. Parameters follow the Windows driver capture:
 /// a 30 ms connection interval and a 5 s supervision timeout.
-pub fn le_extended_create_connection(peer: BdAddr, peer_address_type: u8) -> Vec<u8> {
+pub fn le_extended_create_connection(
+    peer: BdAddr,
+    peer_address_type: u8,
+    supervision_timeout: u16,
+) -> Vec<u8> {
     let mut params = Vec::with_capacity(26);
 
     params.push(0x00); // no accept list, use the peer address below
@@ -391,7 +512,7 @@ pub fn le_extended_create_connection(peer: BdAddr, peer_address_type: u8) -> Vec
     params.extend_from_slice(&0x0018u16.to_le_bytes()); // interval min 30 ms
     params.extend_from_slice(&0x0018u16.to_le_bytes()); // interval max 30 ms
     params.extend_from_slice(&0x0000u16.to_le_bytes()); // latency
-    params.extend_from_slice(&0x01F4u16.to_le_bytes()); // supervision timeout 5 s
+    params.extend_from_slice(&clamp_supervision(supervision_timeout).to_le_bytes());
     params.extend_from_slice(&0x0000u16.to_le_bytes()); // min CE length
     params.extend_from_slice(&0x0000u16.to_le_bytes()); // max CE length
 
@@ -708,6 +829,13 @@ pub fn parse_iso_data_packet(packet: &[u8]) -> Option<IsoData<'_>> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_supervision_timeout_stays_inside_what_the_specification_allows() {
+        assert_eq!(super::clamp_supervision(0), 0x0064, "100 ms floor");
+        assert_eq!(super::clamp_supervision(0xFFFF), 0x0C80, "32 s ceiling");
+        assert_eq!(super::clamp_supervision(0x03E8), 0x03E8, "10 s passes through");
+    }
+
+    #[test]
     fn complete_iso_packet_round_trips_through_parser() {
         let packet = iso_data_packet(0x0042, 17, &[1, 2, 3, 4]);
         let parsed = parse_iso_data_packet(&packet).expect("valid complete SDU");
@@ -784,7 +912,7 @@ mod tests {
         // 0x2043 to 7C:FE:62:72:B4:9A, public address.
         let peer = BdAddr([0x9A, 0xB4, 0x72, 0x62, 0xFE, 0x7C]);
         assert_eq!(
-            le_extended_create_connection(peer, 0x00),
+            le_extended_create_connection(peer, 0x00, 0x01F4),
             vec![
                 0x43, 0x20, 0x1A, 0x00, 0x00, 0x00, 0x9A, 0xB4, 0x72, 0x62, 0xFE, 0x7C, 0x01,
                 0x24, 0x00, 0x12, 0x00, 0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0xF4, 0x01, 0x00,

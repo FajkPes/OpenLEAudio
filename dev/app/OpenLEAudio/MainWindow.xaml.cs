@@ -13,6 +13,7 @@ using Microsoft.Win32;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Media;
 using Windows.Storage.Pickers;
@@ -20,10 +21,32 @@ using Windows.Storage.Pickers;
 namespace OpenLEAudio;
 
 /// <summary>One row of a device list.</summary>
-public sealed class DeviceRow
+/// <summary>One row in the device lists.</summary>
+/// <remarks>
+/// A record, so two rows describing the same device in the same state compare
+/// equal. That is what lets the list be refreshed without replacing items that
+/// have not changed, and replacing an item is what makes a list view rebuild
+/// the row - visibly, if it happens on every status message.
+/// </remarks>
+public sealed record DeviceRow
 {
     public string Address { get; init; } = "";
-    public string Name { get; init; } = "";
+
+    /// <summary>What the row is called, never empty.</summary>
+    /// <remarks>
+    /// A row carrying an empty name renders as an icon, a gap and two buttons,
+    /// which reads as a broken list rather than as a device whose advertisement
+    /// happened to be nameless. The address is always known - it is how the row
+    /// exists at all - so it is the honest fallback, and it is applied here so
+    /// no caller can forget it.
+    /// </remarks>
+    public string Name
+    {
+        get => string.IsNullOrWhiteSpace(_name) ? Address : _name;
+        init => _name = value;
+    }
+
+    private readonly string _name = "";
     public bool Paired { get; init; }
     public bool LeAudio { get; init; }
     public bool Connected { get; init; }
@@ -76,7 +99,13 @@ public sealed class DeviceRow
 public sealed record AdapterChoice(string Name, string InstanceId, string HardwareId,
     string Service, string Driver, bool Supported)
 {
-    public override string ToString() => $"{Name}  ·  {HardwareId}";
+    /// <summary>
+    /// The label in the adapter menu, saying outright when the driver package
+    /// has never heard of this one.
+    /// </summary>
+    public override string ToString() => Supported
+        ? $"{Name}  ·  {HardwareId}"
+        : $"{Name}  ·  {HardwareId}  ·  {Loc.T("setup.not_listed")}";
 }
 
 public sealed partial class MainWindow : Window
@@ -91,13 +120,45 @@ public sealed partial class MainWindow : Window
     private readonly DispatcherQueueTimer _logFlushTimer;
     private AgentClient? _agent;
     private bool _followLog = true;
+
+    /// Whether the bass / mid / treble breakdown is written inside the playing line.
+    ///
+    /// Only that part. The line itself - frame count, channel levels, delivered
+    /// counts, signal, loss - stays either way: it is how anyone sees that the
+    /// stream is still alive, and hiding the whole thing made a working stream
+    /// look like a stopped one. The three band numbers are the part that is only
+    /// interesting while judging how a stream sounds.
+    private bool _levelLogEnabled = true;
     private bool _debugLogEnabled;
+
+    /// How often the playing line is allowed to reach the log.
+    ///
+    /// The measurement behind it keeps running at full rate; this throttles the
+    /// writing alone, so the log stays readable during a long listen without
+    /// costing any of the numbers at the bottom of the window.
+    private TimeSpan _playingEvery = TimeSpan.Zero;
+    private DateTimeOffset _lastPlayingLine = DateTimeOffset.MinValue;
     private bool _programmaticLogScroll;
+
+    /// Whether the settings banner currently belongs to a reconnect in progress,
+    /// so closing it again does not wipe a message somebody else put there.
+    private bool _reconnectNoticeOwned;
     private System.Windows.Forms.NotifyIcon? _trayIcon;
     private bool _runInBackground;
     private bool _exitRequested;
-    private bool _adaptersDetected;
     private bool _startupReconnectEnabled = true;
+
+    /// The last set of environment problems, so identical ones are not re-logged.
+    private string _lastEnvironment = "";
+
+    /// The headphones to reach for first, by address, or empty for "whichever".
+    ///
+    /// This setting existed with a text box in front of it and nothing at all
+    /// behind it: it saved, it survived restarts, and no code ever read it. With
+    /// two paired headsets, startup reconnect took whichever the scan happened
+    /// to report first - so the answer changed from one boot to the next and
+    /// looked like the setting being ignored, which it was.
+    private string _preferredDevice = "";
     private DispatcherQueueTimer? _startupReconnectTimer;
     private DateTimeOffset _startupReconnectUntil;
 
@@ -108,6 +169,25 @@ public sealed partial class MainWindow : Window
     private const int MaxNormalLogLines = 500;
     private sealed record LinkHealthSample(DateTimeOffset Time, long Sent, long Failed);
 
+    /// The union of a device's PAC records: everything it will accept.
+    private sealed record DeviceEnvelope(
+        IReadOnlyList<int> Rates,
+        IReadOnlyList<double> FrameMs,
+        int? OctetsMin,
+        int? OctetsMax);
+
+    /// How a chosen value stands against what the device published.
+    private enum Fit
+    {
+        /// The device listed it. It will work.
+        Supported,
+        /// Within LC3, but this device never offered it. It may be refused.
+        Doubtful,
+        /// The device published a range and this is outside it, or LC3 does not
+        /// define it at all. It will be refused.
+        Refused,
+    }
+
     // UI state lives here, not read back out of controls. Reading a control from
     // the agent's reader thread throws, and an exception there kills the reader
     // loop - which looks exactly like a stack that stopped talking: an empty
@@ -115,6 +195,22 @@ public sealed partial class MainWindow : Window
     private bool _adapterOn;
     private string? _connectedAddress;
     private bool _suppressToggle;
+
+    /// Battery percentages as the device last published them, in its own order.
+    private List<int> _batteryLevels = new();
+
+    /// What the connected headphones said they can decode.
+    ///
+    /// Null when nothing is connected, which is a real state and not a missing
+    /// value: with no device to ask, no codec setting can be called wrong.
+    private DeviceEnvelope? _capabilities;
+
+    /// When the current connection was established, for the uptime display.
+    private DateTimeOffset? _connectedSince;
+
+    /// Ticks the uptime label. Nothing else needs a clock, so it runs only
+    /// while something is connected.
+    private DispatcherQueueTimer? _uptimeTimer;
 
     /// Set while a reconnect is in flight, so the disconnect that starts it
     /// knows to connect again rather than simply stopping.
@@ -142,8 +238,32 @@ public sealed partial class MainWindow : Window
         "max_latency_ms", "presentation_delay_ms",
     };
 
+    /// Marks a control that cannot share a row with its own label.
+    private const string NeedsFullWidth = "wide";
+
     /// The "saved" label beside each control, by setting key.
     private readonly Dictionary<string, TextBlock> _savedMarkers = new();
+
+    /// The capability warning under each codec control, by setting key.
+    private readonly Dictionary<string, TextBlock> _codecNotes = new();
+
+    /// The values a headset is entitled to refuse, and therefore the only ones
+    /// worth judging against what it published.
+    private static readonly HashSet<string> CodecJudgedKeys = new(StringComparer.Ordinal)
+    {
+        "rate_hz", "frame_ms", "octets",
+    };
+
+    /// The last value seen for each judged key, so a warning can be refreshed
+    /// when capabilities arrive after the page was built.
+    private readonly Dictionary<string, string> _codecValues = new();
+
+    /// Every setting's current value, for the estimates that need more than one.
+    ///
+    /// Airtime is a property of the whole configuration - the bitrate matters
+    /// less at 10 ms frames than at 7.5, and not at all if the stream is mono -
+    /// so a per-setting estimate cannot be made from that setting alone.
+    private readonly Dictionary<string, string> _settingValues = new(StringComparer.Ordinal);
 
     public MainWindow()
     {
@@ -153,6 +273,8 @@ public sealed partial class MainWindow : Window
         // Setting IsOn in XAML raises Toggled while later elements such as the
         // log ScrollViewer are still null and used to crash the whole startup.
         FollowLogSwitch.IsOn = true;
+        LevelLogSwitch.IsOn = true;
+        FillPlayingRates();
         _logFlushTimer = _ui.CreateTimer();
         _logFlushTimer.Interval = TimeSpan.FromMilliseconds(100);
         _logFlushTimer.IsRepeating = true;
@@ -164,6 +286,7 @@ public sealed partial class MainWindow : Window
         SettingsHost.SizeChanged += SettingsHostSizeChanged;
         AboutDetailsGrid.SizeChanged += AboutDetailsGridSizeChanged;
         AboutMappingGrid.SizeChanged += AboutMappingGridSizeChanged;
+        AboutTimingGrid.SizeChanged += AboutTimingGridSizeChanged;
 
         ConfigureTray();
         AppWindow.Closing += OnAppWindowClosing;
@@ -258,7 +381,14 @@ public sealed partial class MainWindow : Window
         }
         if (!_adapterOn || Busy.IsActive) return;
 
-        var candidate = _found.FirstOrDefault(row => row.Paired && row.LeAudio);
+        // The chosen headphones first, then any paired LE Audio device. Falling
+        // back rather than insisting is deliberate: a preferred device that is
+        // switched off should not stop the other pair from connecting.
+        var candidate =
+            _found.FirstOrDefault(row => row.Paired &&
+                string.Equals(row.Address, _preferredDevice, StringComparison.OrdinalIgnoreCase))
+            ?? _found.FirstOrDefault(row => row.Paired && row.LeAudio);
+
         if (candidate is not null)
         {
             Busy.IsActive = true;
@@ -419,6 +549,52 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private void LevelLogToggled(object sender, RoutedEventArgs e)
+    {
+        if (sender is not ToggleSwitch toggle)
+        {
+            return;
+        }
+
+        _levelLogEnabled = toggle.IsOn;
+
+        // A log that suddenly stops producing lines looks like the stream
+        // stopping. Say which it is.
+        Append(Loc.T(_levelLogEnabled ? "log.levels_on" : "log.levels_off"));
+    }
+
+    /// <summary>The choices for how often the playing line is written.</summary>
+    /// <remarks>
+    /// Seconds, with zero meaning "every one". Kept as a tag rather than parsed
+    /// back out of the label so translating the labels cannot change behaviour.
+    /// </remarks>
+    private static readonly (string Key, int Seconds)[] PlayingRates =
+    {
+        ("console.rate_every", 0),
+        ("console.rate_1s", 1),
+        ("console.rate_2s", 2),
+        ("console.rate_5s", 5),
+        ("console.rate_15s", 15),
+    };
+
+    private void FillPlayingRates()
+    {
+        PlayingRateBox.Items.Clear();
+        foreach (var (key, seconds) in PlayingRates)
+        {
+            PlayingRateBox.Items.Add(new ComboBoxItem { Content = Loc.T(key), Tag = seconds });
+        }
+        PlayingRateBox.SelectedIndex = 0;
+    }
+
+    private void PlayingRateChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (PlayingRateBox?.SelectedItem is ComboBoxItem { Tag: int seconds })
+        {
+            _playingEvery = TimeSpan.FromSeconds(seconds);
+        }
+    }
+
     private void FollowLogToggled(object sender, RoutedEventArgs e)
     {
         if (sender is not ToggleSwitch toggle || LogScroller is null) return;
@@ -431,6 +607,8 @@ public sealed partial class MainWindow : Window
 
     private void ScrollLogBottomClicked(object sender, RoutedEventArgs e)
     {
+        // Only what the button says. It used to switch the band levels back on
+        // as well, which quietly undid a choice the user had just made.
         FollowLogSwitch.IsOn = true;
         _followLog = true;
         ScrollLogToBottom();
@@ -441,16 +619,13 @@ public sealed partial class MainWindow : Window
         if (sender is not ToggleSwitch toggle || LogText is null) return;
         _debugLogEnabled = toggle.IsOn;
         Send("debug", new() { ["on"] = toggle.IsOn });
-        if (!toggle.IsOn)
-        {
-            lock (_logGate) _pendingLog.Clear();
-            LogText.Text = "";
-            Append(Loc.T("log.debug_disabled"));
-        }
-        else
-        {
-            Append(Loc.T("log.debug_enabled"));
-        }
+
+        // Deliberately not cleared. Switching debug off used to empty the whole
+        // window, which took the connection history with it - exactly the part
+        // worth keeping, and the part that cannot be produced again without
+        // reconnecting. From here on it only stops new packet-level detail and
+        // lets Append trim the backlog to the shorter history limit.
+        Append(Loc.T(toggle.IsOn ? "log.debug_enabled" : "log.debug_disabled"));
     }
 
     private void PageChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
@@ -463,7 +638,20 @@ public sealed partial class MainWindow : Window
         LanguagePage.Visibility = tag == "language" ? Visibility.Visible : Visibility.Collapsed;
         AboutPage.Visibility = tag == "about" ? Visibility.Visible : Visibility.Collapsed;
 
-        if (tag == "setup" && !_adaptersDetected) _ = DetectAdaptersAsync();
+        if (tag == "setup")
+        {
+            ShowDependencies();
+
+            // Detected again on every visit, not once per launch. A dongle
+            // plugged in after startup is exactly when somebody opens this page,
+            // and caching the first answer meant the page told them their
+            // adapter was missing while it sat in the port in front of them.
+            _ = DetectAdaptersAsync();
+
+            // Same reason on the other side: the core's own view of the driver
+            // binding is a snapshot from when it started.
+            Send("check");
+        }
 
         if (tag is "settings" or "language")
         {
@@ -500,6 +688,80 @@ public sealed partial class MainWindow : Window
 
     private async void DetectAdaptersClicked(object sender, RoutedEventArgs e) => await DetectAdaptersAsync();
 
+    private void CheckDependenciesClicked(object sender, RoutedEventArgs e) => ShowDependencies();
+
+    /// <summary>One runtime OpenLEAudio needs, and whether it is there.</summary>
+    private sealed record Dependency(string Name, bool Present, string Detail);
+
+    /// <summary>
+    /// What the application needs from Windows before it can do anything.
+    /// </summary>
+    /// <remarks>
+    /// Checked by looking for the files and packages themselves rather than
+    /// through an installer's registry keys. A repair or a partial uninstall can
+    /// leave the keys behind after the payload has gone, and a check that
+    /// believes them reports everything as fine while the application refuses to
+    /// start.
+    ///
+    /// The Visual C++ runtime is the one worth naming: nothing else in the chain
+    /// installs it, and without it the process exits before the first window
+    /// exists - no crash dialog, no log, nothing to go on.
+    /// </remarks>
+    private static List<Dependency> CheckDependencies()
+    {
+        var system = Environment.GetFolderPath(Environment.SpecialFolder.System);
+
+        var vcFiles = new[] { "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll" };
+        var missingVc = vcFiles.Where(name => !File.Exists(Path.Combine(system, name))).ToList();
+
+        // This code is running, so the two runtimes that host it are present by
+        // definition. Saying so is still worth a line: someone reading this
+        // panel wants to know the whole list is accounted for, not to be left
+        // wondering which entries were skipped.
+        return new List<Dependency>
+        {
+            new(".NET 8 Desktop Runtime", true,
+                System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription),
+            new("Windows App Runtime 1.8", true, "loaded"),
+            new("Visual C++ 2015-2022 Redistributable", missingVc.Count == 0,
+                missingVc.Count == 0 ? "installed" : $"missing: {string.Join(", ", missingVc)}"),
+        };
+    }
+
+    private void ShowDependencies()
+    {
+        var dependencies = CheckDependencies();
+        DependencyList.Children.Clear();
+
+        foreach (var dependency in dependencies)
+        {
+            var row = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 8,
+            };
+            row.Children.Add(new FontIcon
+            {
+                Glyph = dependency.Present ? "\uE73E" : "\uEA39",
+                FontSize = 13,
+                Foreground = Brush(dependency.Present
+                    ? "SystemFillColorSuccessBrush"
+                    : "SystemFillColorCriticalBrush"),
+                VerticalAlignment = VerticalAlignment.Center,
+            });
+            row.Children.Add(new TextBlock
+            {
+                Text = $"{dependency.Name} - {dependency.Detail}",
+                FontSize = 12,
+                TextWrapping = TextWrapping.Wrap,
+                VerticalAlignment = VerticalAlignment.Center,
+            });
+            DependencyList.Children.Add(row);
+        }
+
+        InstallDependenciesButton.IsEnabled = dependencies.Any(item => !item.Present);
+    }
+
     private async Task DetectAdaptersAsync()
     {
         SetupAdapterBox.IsEnabled = false;
@@ -522,10 +784,29 @@ public sealed partial class MainWindow : Window
             // PowerShell 5.1 and PowerShell 7.
             var adapters = await Task.Run(() => EnumerateSupportedAdapters(supportedIds));
 
+            // Supported ones first, so the menu opens on something usable even
+            // when a second radio is present.
+            adapters = adapters
+                .OrderByDescending(adapter => adapter.Supported)
+                .ThenBy(adapter => adapter.Name)
+                .ToList();
+
             SetupAdapterBox.ItemsSource = adapters;
             SetupAdapterBox.SelectedIndex = adapters.Count > 0 ? 0 : -1;
-            _adaptersDetected = true;
-            if (adapters.Count == 0) SetupAdapterDetails.Text = Loc.T("setup.none");
+
+            // A supported adapter that is simply not there is the one failure
+            // on this page with no error message of its own: the menu just
+            // stays empty, which reads as the page still loading. Say it, and
+            // mark the control that has nothing in it.
+            var none = adapters.Count == 0;
+            SetupAdapterBox.BorderBrush = none
+                ? Brush("SystemFillColorCriticalBrush")
+                : Brush("ControlStrokeColorDefaultBrush");
+            SetupAdapterBox.BorderThickness = new Thickness(none ? 2 : 1);
+            SetupAdapterDetails.Foreground = none
+                ? Brush("SystemFillColorCriticalBrush")
+                : Brush("TextFillColorSecondaryBrush");
+            if (none) SetupAdapterDetails.Text = Loc.T("setup.none");
         }
         catch (Exception error)
         {
@@ -540,6 +821,7 @@ public sealed partial class MainWindow : Window
     private const uint DigcfPresent = 0x00000002;
     private const uint DigcfAllClasses = 0x00000004;
     private const uint SpdrpDeviceDesc = 0x00000000;
+    private const uint SpdrpCompatibleIds = 0x00000002;
     private const uint SpdrpService = 0x00000004;
     private const uint SpdrpFriendlyName = 0x0000000C;
 
@@ -595,6 +877,26 @@ public sealed partial class MainWindow : Window
                 var instance = instanceBuffer.ToString();
                 var hardwareId = supportedIds.FirstOrDefault(id =>
                     instance.StartsWith(id, StringComparison.OrdinalIgnoreCase));
+
+                // Not in the INF, but still worth listing if it is a Bluetooth
+                // controller. Leaving those out meant somebody with a different
+                // dongle saw an empty menu and no way to tell "the adapter is
+                // not plugged in" from "the adapter is here and this program
+                // has never heard of it" - which are opposite problems with
+                // opposite fixes.
+                var supported = hardwareId is not null;
+                if (!supported)
+                {
+                    var compatible = SetupDeviceProperty(set, ref data, SpdrpCompatibleIds);
+                    if (!compatible.Contains("Class_E0&SubClass_01&Prot_01",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                    hardwareId = BareHardwareId(instance);
+                    if (hardwareId is null) continue;
+                }
+
                 if (hardwareId is null) continue;
 
                 var name = SetupDeviceProperty(set, ref data, SpdrpFriendlyName);
@@ -602,7 +904,7 @@ public sealed partial class MainWindow : Window
                 var service = SetupDeviceProperty(set, ref data, SpdrpService);
                 result.Add(new AdapterChoice(
                     string.IsNullOrWhiteSpace(name) ? description : name,
-                    instance, hardwareId, service, description, true));
+                    instance, hardwareId, service, description, supported));
             }
         }
         finally
@@ -610,6 +912,19 @@ public sealed partial class MainWindow : Window
             SetupDiDestroyDeviceInfoList(set);
         }
         return result;
+    }
+
+    /// <summary>The plain USB\VID_xxxx&amp;PID_xxxx part of a device instance id.</summary>
+    /// <remarks>
+    /// The form an INF matches on. The rest of the instance id names one
+    /// physical port and one firmware revision, neither of which belongs in a
+    /// driver package.
+    /// </remarks>
+    private static string? BareHardwareId(string instance)
+    {
+        var match = Regex.Match(instance, @"^USB\\VID_[0-9A-Fa-f]{4}&PID_[0-9A-Fa-f]{4}",
+            RegexOptions.IgnoreCase);
+        return match.Success ? match.Value.ToUpperInvariant() : null;
     }
 
     private static string SetupDeviceProperty(nint set, ref SpDevinfoData data, uint property)
@@ -630,6 +945,17 @@ public sealed partial class MainWindow : Window
             string.Equals(adapter.Service, "WinUSB", StringComparison.OrdinalIgnoreCase);
         SetupAdapterDetails.Text = Loc.T("setup.adapter_detail", adapter.Name, adapter.HardwareId,
             string.IsNullOrWhiteSpace(adapter.Driver) ? "-" : adapter.Driver, binding, support);
+
+        // Bound to Windows rather than to us: the adapter exists and nothing
+        // here will work until it is switched over.
+        var ours = string.Equals(adapter.Service, "WinUSB", StringComparison.OrdinalIgnoreCase);
+        SetupAdapterBox.BorderBrush = ours
+            ? Brush("SystemFillColorSuccessBrush")
+            : Brush("SystemFillColorCautionBrush");
+        SetupAdapterBox.BorderThickness = new Thickness(ours ? 1 : 2);
+        SetupAdapterDetails.Foreground = ours
+            ? Brush("TextFillColorSecondaryBrush")
+            : Brush("SystemFillColorCautionBrush");
     }
 
     private void SetupActionClicked(object sender, RoutedEventArgs e)
@@ -662,6 +988,7 @@ public sealed partial class MainWindow : Window
             case "vbcable-setup": script = Path.Combine(root, "scripts", "setup-vbcable.ps1"); operation = "-Apply"; break;
             case "vbcable-restore": script = Path.Combine(root, "scripts", "setup-vbcable.ps1"); operation = "-Restore"; break;
             case "vbcable-status": script = Path.Combine(root, "scripts", "setup-vbcable.ps1"); operation = ""; elevated = false; break;
+            case "dependencies": RunDependencyInstaller(root); return;
             default: return;
         }
 
@@ -682,6 +1009,60 @@ public sealed partial class MainWindow : Window
                 start.ArgumentList.Add(adapter.HardwareId);
             }
             Process.Start(start);
+
+            // Binding the adapter to our driver changes what the audio core
+            // finds when it opens the device, and the core has already opened
+            // it. Nothing short of restarting it picks that up, so say so
+            // rather than leaving the user to discover it by trying to connect
+            // and being told the adapter is on the Microsoft stack.
+            var needsRestart = action is "adapter-bind" or "adapter-restore";
+            SetupNotice.Severity = needsRestart
+                ? InfoBarSeverity.Warning
+                : InfoBarSeverity.Informational;
+            SetupNotice.Message = Loc.T(needsRestart ? "setup.restart_needed" : "setup.started");
+            if (needsRestart)
+            {
+                var restart = new Button { Content = Loc.T("setup.restart_now") };
+                restart.Click += (_, _) => RestartApplication();
+                SetupNotice.ActionButton = restart;
+            }
+            else
+            {
+                SetupNotice.ActionButton = null;
+            }
+            SetupNotice.IsOpen = true;
+        }
+        catch (Exception error) when (error is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            ShowSetupError(error.Message);
+        }
+    }
+
+    /// <summary>
+    /// Runs the dependency installer, which lives beside the release rather
+    /// than in the scripts directory because it must work before anything else
+    /// is set up.
+    /// </summary>
+    private void RunDependencyInstaller(string root)
+    {
+        var installer = Path.Combine(root, "INSTALL dependencies.bat");
+        if (!File.Exists(installer))
+        {
+            ShowSetupError(Loc.T("setup.files_missing"));
+            return;
+        }
+
+        try
+        {
+            // Elevated: installing a Microsoft runtime writes to system
+            // directories, and a silent failure here is the hardest kind to
+            // diagnose because everything downstream simply does not start.
+            Process.Start(new ProcessStartInfo(installer)
+            {
+                UseShellExecute = true,
+                Verb = "runas",
+                WorkingDirectory = root,
+            });
             SetupNotice.Severity = InfoBarSeverity.Informational;
             SetupNotice.Message = Loc.T("setup.started");
             SetupNotice.IsOpen = true;
@@ -690,6 +1071,37 @@ public sealed partial class MainWindow : Window
         {
             ShowSetupError(error.Message);
         }
+    }
+
+    /// <summary>Starts a fresh copy and closes this one.</summary>
+    /// <remarks>
+    /// The audio core is a child process holding the adapter, so it has to go
+    /// with us: a new instance would find the device still owned and report it
+    /// as bound to another driver, which is the confusion this button exists to
+    /// avoid.
+    /// </remarks>
+    private void RestartApplication()
+    {
+        var executable = Environment.ProcessPath;
+        if (executable is null)
+        {
+            ShowSetupError(Loc.T("setup.files_missing"));
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(executable) { UseShellExecute = true });
+        }
+        catch (Exception error) when (error is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            ShowSetupError(error.Message);
+            return;
+        }
+
+        _exitRequested = true;
+        _agent?.Dispose();
+        Close();
     }
 
     private void ShowSetupError(string message)
@@ -725,6 +1137,16 @@ public sealed partial class MainWindow : Window
 
         Busy.IsActive = true;
         ScanStatus.Text = AdapterSwitch.IsOn ? Loc.T("status.turning_on") : Loc.T("status.turning_off");
+
+        // Asked again before turning it on. The environment report is made once
+        // at startup, and a dongle plugged in afterwards leaves it saying the
+        // adapter is on the Microsoft stack - which by then is simply out of
+        // date, and reads as the app refusing to see hardware that is plainly
+        // there.
+        if (AdapterSwitch.IsOn)
+        {
+            Send("check");
+        }
         Send("adapter", new() { ["on"] = AdapterSwitch.IsOn });
     }
 
@@ -850,12 +1272,13 @@ public sealed partial class MainWindow : Window
 
             case "capabilities":
                 Append(Text(message, "summary"));
+                RememberCapabilities(message);
                 break;
 
             case "connected":
                 _connectedAddress = Text(message, "address");
                 _healthSamples.Clear();
-                Busy.IsActive = false;
+                ShowReconnecting(false);
                 ShowConnectedHint();
                 PromoteToPaired(_connectedAddress, Text(message, "name"), true, true);
                 foreach (var pendingKey in _pendingReconnectMarkers)
@@ -865,6 +1288,7 @@ public sealed partial class MainWindow : Window
                 }
                 _pendingReconnectMarkers.Clear();
                 _startupReconnectTimer?.Stop();
+                StartUptimeClock();
                 Append(Loc.T("log.connected"));
                 Send("status");
                 break;
@@ -873,6 +1297,7 @@ public sealed partial class MainWindow : Window
                 Update(_connectedAddress, row => row.With(connected: false, streaming: false, connecting: false));
                 _connectedAddress = null;
                 _healthSamples.Clear();
+                StopUptimeClock();
                 SignalMetric.Text = Loc.T("metrics.signal", "-");
                 LossMetric.Text = Loc.T("metrics.loss", 0, "0.00 %");
                 StabilityMetric.Text = Loc.T("metrics.waiting");
@@ -885,15 +1310,44 @@ public sealed partial class MainWindow : Window
                 }
                 break;
 
+            case "reconnect-started":
+                // The point where a failed connection stops being an error the
+                // user has to act on and becomes something the stack is
+                // handling. Without this the row sat on the last error message
+                // while attempts carried on invisibly underneath it.
+                Update(Text(message, "address"), row => row.With(connecting: true));
+                ShowReconnecting(true);
+                Append(Loc.T("log.reconnect_started"));
+                break;
+
             case "reconnecting":
                 Update(Text(message, "address"), row => row.With(connecting: true));
-                Busy.IsActive = true;
+                ShowReconnecting(true);
                 Append(Loc.T("log.reconnecting"));
+                break;
+
+            case "availability":
+                // Only worth a line when it is not the ordinary case. "The
+                // headphones are free" is what everyone expects and saying it
+                // every time buries the one occasion it is not true.
+                if (Text(message, "state") != "ready")
+                {
+                    Append(Text(message, "detail"));
+                }
+                break;
+
+            case "yielded":
+                Update(_connectedAddress, row => row.With(streaming: false));
+                Append(Loc.T("log.yielded"));
+                break;
+
+            case "reclaiming":
+                Append(Loc.T("log.reclaiming"));
                 break;
 
             case "reconnect-stopped":
                 Update(Text(message, "address"), row => row.With(connecting: false));
-                Busy.IsActive = false;
+                ShowReconnecting(false);
                 Append(Loc.T("log.reconnect_stopped"));
                 break;
 
@@ -916,6 +1370,14 @@ public sealed partial class MainWindow : Window
 
             case "applied":
                 OnApplied(message);
+                break;
+
+            case "environment":
+                ShowEnvironment(message);
+                break;
+
+            case "battery":
+                OnBattery(message);
                 break;
 
             case "log":
@@ -945,9 +1407,16 @@ public sealed partial class MainWindow : Window
         var failed = message.GetProperty("failed").GetInt64();
         var frames = message.GetProperty("frames").GetInt64();
 
-        var line = $"playing: {frames} frames, L {Level(message, "leftDb")} / R {Level(message, "rightDb")}"
-                   + $", bass {Level(message, "bassDb")} / mid {Level(message, "midDb")}"
-                   + $" / treble {Level(message, "trebleDb")}";
+        var line = $"playing: {frames} frames, L {Level(message, "leftDb")} / R {Level(message, "rightDb")}";
+
+        // The band breakdown is the only optional part. Everything else on this
+        // line answers "is it still playing, and is the radio keeping up", which
+        // is worth keeping visible for as long as the stream runs.
+        if (_levelLogEnabled)
+        {
+            line += $", bass {Level(message, "bassDb")} / mid {Level(message, "midDb")}"
+                  + $" / treble {Level(message, "trebleDb")}";
+        }
 
         // Per channel, from the controller: the number that separates "both
         // streams are transmitting" from "one of them silently is not".
@@ -967,16 +1436,60 @@ public sealed partial class MainWindow : Window
             line += $", SELHALO {failed}";
         }
 
-        Append(line);
+        // What the radio itself reports, when the controller supports being
+        // asked. This is the number that means "the headphones did not hear
+        // it"; the USB submit failures counted below only mean "it never left
+        // this PC", which is almost never what goes wrong and is why this
+        // display used to sit at zero through audible dropouts.
+        long radioLost = 0;
+        var haveRadio = false;
+        if (message.TryGetProperty("radio", out var radio) && radio.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var channel in radio.EnumerateArray())
+            {
+                if (channel.TryGetProperty("lost", out var lost)
+                    && lost.ValueKind == JsonValueKind.Number)
+                {
+                    radioLost += lost.GetInt64();
+                    haveRadio = true;
+                }
+            }
+        }
+
+        if (haveRadio)
+        {
+            line += $", lost on air {radioLost}";
+        }
+
+        if (message.TryGetProperty("underruns", out var underrunValue)
+            && underrunValue.ValueKind == JsonValueKind.Number
+            && underrunValue.GetInt64() > 0)
+        {
+            // Counted apart from radio loss on purpose: this is Windows failing
+            // to hand over audio in time, and it sounds identical to a link
+            // problem. Blaming the radio for it sends the search the wrong way.
+            line += $", PC underruns {underrunValue.GetInt64()}";
+        }
+
+        // Printed last, so everything appended above is on the same line. The
+        // metrics strip below is updated either way: throttling the display must
+        // not stop the measurement, or the numbers at the bottom would freeze
+        // along with the log.
+        var now = DateTimeOffset.UtcNow;
+        if (_playingEvery == TimeSpan.Zero || now - _lastPlayingLine >= _playingEvery)
+        {
+            _lastPlayingLine = now;
+            Append(line);
+        }
 
         var sent = message.TryGetProperty("sent", out var sentValue) ? sentValue.GetInt64() : frames;
-        var now = DateTimeOffset.UtcNow;
-        _healthSamples.Enqueue(new LinkHealthSample(now, sent, failed));
+        var lostTotal = haveRadio ? radioLost : failed;
+        _healthSamples.Enqueue(new LinkHealthSample(now, sent, lostTotal));
         while (_healthSamples.Count > 1 && now - _healthSamples.Peek().Time > TimeSpan.FromSeconds(60))
             _healthSamples.Dequeue();
 
         var oldest = _healthSamples.Peek();
-        var lost60 = Math.Max(0, failed - oldest.Failed);
+        var lost60 = Math.Max(0, lostTotal - oldest.Failed);
         var sent60 = Math.Max(0, sent - oldest.Sent);
         var lossPercent = sent60 > 0 ? lost60 * 100.0 / sent60 : 0.0;
         SignalMetric.Text = Loc.T("metrics.signal", rssi is null ? "-" : $"{rssi} dBm");
@@ -1022,6 +1535,475 @@ public sealed partial class MainWindow : Window
     private static string Text(JsonElement message, string property) =>
         message.TryGetProperty(property, out var value) ? value.GetString() ?? "" : "";
 
+    /// <summary>
+    /// Shows what is standing between the machine and working audio.
+    /// </summary>
+    /// <remarks>
+    /// One bar, showing the most serious problem, with a button that goes
+    /// straight to the step that fixes it. A list of five simultaneous
+    /// complaints is read as noise; the first one is usually the cause of the
+    /// rest anyway, and the others reappear once it is dealt with.
+    ///
+    /// The full set still goes to the log, so nothing is hidden - it is only
+    /// not all shouted at once.
+    /// </remarks>
+    private void ShowEnvironment(JsonElement message)
+    {
+        if (!message.TryGetProperty("issues", out var issues)
+            || issues.ValueKind != JsonValueKind.Array)
+        {
+            return;
+        }
+
+        // The check runs on startup and again whenever the radio is asked for,
+        // so the same three complaints were written to the log every time. A
+        // log that repeats itself is one people stop reading, which defeats the
+        // point of warning them at all. The bar is still refreshed either way.
+        var fingerprint = issues.GetRawText();
+        var repeated = fingerprint == _lastEnvironment;
+        _lastEnvironment = fingerprint;
+        if (!repeated && issues.GetArrayLength() > 0)
+        {
+            // Laid out as a list, with the problems before the warnings and the
+            // remedy indented under each one. Run together as sentences these
+            // were four unbroken lines of prose that wrapped into each other,
+            // and the thing a person actually needs - which button to press -
+            // was buried in the middle of it.
+            Append("");
+            Append(Loc.T("environment.heading"));
+
+            var ordered = issues.EnumerateArray()
+                .OrderBy(issue => Text(issue, "severity") == "error" ? 0 : 1)
+                .ToList();
+
+            foreach (var issue in ordered)
+            {
+                var label = Text(issue, "severity") == "error"
+                    ? Loc.T("environment.problem")
+                    : Loc.T("environment.warning");
+                Append($"  [{label}] {Text(issue, "summary")}");
+                Append($"      {Text(issue, "remedy")}");
+            }
+            Append("");
+        }
+
+        ShowSetupStatus(issues);
+
+        var first = issues.EnumerateArray().FirstOrDefault();
+        if (first.ValueKind != JsonValueKind.Object)
+        {
+            EnvironmentNotice.IsOpen = false;
+            EnvironmentNotice.ActionButton = null;
+            return;
+        }
+
+        var count = issues.GetArrayLength();
+        var blocking = Text(first, "severity") == "error";
+
+        EnvironmentNotice.Severity = blocking
+            ? InfoBarSeverity.Error
+            : InfoBarSeverity.Warning;
+        EnvironmentNotice.Title = Text(first, "summary");
+        EnvironmentNotice.Message = count > 1
+            ? $"{Text(first, "remedy")} ({count - 1} more to check in the log.)"
+            : Text(first, "remedy");
+
+        // Only when there is somewhere useful to send them. A button that opens
+        // a page with nothing to press on it is worse than no button.
+        var action = Text(first, "setupAction");
+        if (action.Length > 0)
+        {
+            var button = new Button { Content = Loc.T("environment.open_setup") };
+            button.Click += (_, _) =>
+            {
+                // Selecting the item is what switches the page: PageChanged
+                // does the visibility, and reaching past it would leave the
+                // navigation highlight pointing somewhere else.
+                var setup = Nav.MenuItems.OfType<NavigationViewItem>()
+                    .FirstOrDefault(item => (item.Tag as string) == "setup");
+                if (setup is not null)
+                {
+                    Nav.SelectedItem = setup;
+                }
+            };
+            EnvironmentNotice.ActionButton = button;
+        }
+        else
+        {
+            EnvironmentNotice.ActionButton = null;
+        }
+
+        EnvironmentNotice.IsOpen = true;
+    }
+
+    /// <summary>
+    /// Battery levels, as the device publishes them.
+    /// </summary>
+    /// <remarks>
+    /// One entry per Battery Service instance. Earbuds conventionally list left,
+    /// right and then the case, but nothing in the specification says so - which
+    /// is why the display shows them in order rather than labelling them.
+    /// </remarks>
+    private void OnBattery(JsonElement message)
+    {
+        if (!message.TryGetProperty("levels", out var levels)
+            || levels.ValueKind != JsonValueKind.Array)
+        {
+            return;
+        }
+
+        _batteryLevels = levels.EnumerateArray()
+            .Where(level => level.ValueKind == JsonValueKind.Number)
+            .Select(level => level.GetInt32())
+            .ToList();
+
+        RefreshConnectionStatus();
+    }
+
+    /// <summary>
+    /// Redraws the battery cells and the uptime label.
+    /// </summary>
+    /// <remarks>
+    /// The battery is drawn rather than written, because a percentage in a row
+    /// of percentages is read only when someone goes looking for it. A shape
+    /// that is visibly nearly empty is noticed on the way past, which is the
+    /// entire point of showing it.
+    /// </remarks>
+    private void RefreshConnectionStatus()
+    {
+        BatteryStrip.Children.Clear();
+
+        if (_connectedAddress is null || _batteryLevels.Count == 0)
+        {
+            BatteryStrip.Visibility = Visibility.Collapsed;
+        }
+        else
+        {
+            BatteryStrip.Visibility = Visibility.Visible;
+            for (var index = 0; index < _batteryLevels.Count; index++)
+            {
+                BatteryStrip.Children.Add(BuildBatteryCell(_batteryLevels[index], index));
+            }
+        }
+
+        UptimeMetric.Text = _connectedSince is { } since
+            ? Loc.T("metrics.uptime", FormatDuration(DateTimeOffset.UtcNow - since))
+            : Loc.T("metrics.uptime", "-");
+    }
+
+    /// <summary>One battery, as an outline with a fill proportional to charge.</summary>
+    private FrameworkElement BuildBatteryCell(int percent, int index)
+    {
+        percent = Math.Clamp(percent, 0, 100);
+
+        // Red below a tenth, amber below a fifth. The thresholds are the ones
+        // Windows itself uses, so the colour means the same thing here as it
+        // does everywhere else on the machine.
+        var fill = percent <= 10
+            ? Brush("SystemFillColorCriticalBrush")
+            : percent <= 20
+                ? Brush("SystemFillColorCautionBrush")
+                : Brush("SystemFillColorSuccessBrush");
+
+        const double BodyWidth = 26;
+        const double BodyHeight = 13;
+
+        var level = new Border
+        {
+            Width = Math.Max(2, (BodyWidth - 4) * percent / 100.0),
+            Height = BodyHeight - 4,
+            CornerRadius = new CornerRadius(1),
+            Background = fill,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(1.5, 0, 0, 0),
+        };
+
+        var body = new Border
+        {
+            Width = BodyWidth,
+            Height = BodyHeight,
+            CornerRadius = new CornerRadius(3),
+            BorderThickness = new Thickness(1),
+            BorderBrush = Brush("TextFillColorSecondaryBrush"),
+            VerticalAlignment = VerticalAlignment.Center,
+            Child = level,
+        };
+
+        // The terminal on the positive end. Small, but without it the outline
+        // reads as a progress bar rather than a battery.
+        var cap = new Border
+        {
+            Width = 2,
+            Height = 5,
+            CornerRadius = new CornerRadius(0, 1, 1, 0),
+            Background = Brush("TextFillColorSecondaryBrush"),
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+
+        var shape = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 1 };
+        shape.Children.Add(body);
+        shape.Children.Add(cap);
+
+        var cell = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 6,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        cell.Children.Add(shape);
+        cell.Children.Add(new TextBlock
+        {
+            Text = $"{percent} %",
+            FontSize = 12,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            VerticalAlignment = VerticalAlignment.Center,
+        });
+
+        // Nothing in the specification says which instance is which ear, so the
+        // tooltip numbers them rather than inventing labels that may be wrong.
+        var name = _batteryLevels.Count > 1
+            ? Loc.T("metrics.battery_part", index + 1, _batteryLevels.Count)
+            : Loc.T("metrics.battery");
+        ToolTipService.SetToolTip(cell, name + Environment.NewLine + Loc.T("battery.refresh_tip"));
+
+        // Clickable, because a battery indicator that only moves when the
+        // headphones feel like saying so is one nobody trusts. The request goes
+        // to the audio loop, which owns the link while music plays and is the
+        // only thing that can put a question on it.
+        var button = new Button
+        {
+            Content = cell,
+            Padding = new Thickness(4, 2, 4, 2),
+            Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(
+                Windows.UI.Color.FromArgb(0, 0, 0, 0)),
+            BorderThickness = new Thickness(0),
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        button.Click += (_, _) =>
+        {
+            Append(Loc.T("log.battery_requested"));
+            Send("battery");
+        };
+
+        return button;
+    }
+
+    private static string FormatDuration(TimeSpan elapsed)
+    {
+        if (elapsed < TimeSpan.Zero)
+        {
+            elapsed = TimeSpan.Zero;
+        }
+
+        return elapsed.TotalHours >= 1
+            ? $"{(int)elapsed.TotalHours} h {elapsed.Minutes} min"
+            : elapsed.TotalMinutes >= 1
+                ? $"{elapsed.Minutes} min {elapsed.Seconds} s"
+                : $"{elapsed.Seconds} s";
+    }
+
+    private void StartUptimeClock()
+    {
+        _connectedSince = DateTimeOffset.UtcNow;
+
+        // A second is the shortest unit the label ever shows, so anything faster
+        // would be redrawing to display the same string.
+        _uptimeTimer ??= _ui.CreateTimer();
+        _uptimeTimer.Interval = TimeSpan.FromSeconds(1);
+        _uptimeTimer.IsRepeating = true;
+        _uptimeTimer.Tick -= UptimeTick;
+        _uptimeTimer.Tick += UptimeTick;
+        _uptimeTimer.Start();
+
+        RefreshConnectionStatus();
+    }
+
+    private void UptimeTick(DispatcherQueueTimer sender, object args) => RefreshConnectionStatus();
+
+    private void StopUptimeClock()
+    {
+        _uptimeTimer?.Stop();
+        _connectedSince = null;
+        _batteryLevels = new List<int>();
+        RefreshConnectionStatus();
+    }
+
+    /// <summary>
+    /// Marks the Setup steps that have something wrong with them.
+    /// </summary>
+    /// <remarks>
+    /// The Devices page shows one bar naming the most serious problem. Setup is
+    /// where the problems are actually fixed, so each step says whether it is
+    /// the one at fault - otherwise someone arriving here from the bar has four
+    /// numbered cards and no indication which of them to press.
+    /// </remarks>
+    private void ShowSetupStatus(JsonElement issues)
+    {
+        string? adapter = null;
+        string? cable = null;
+        var adapterBlocking = false;
+        var cableBlocking = false;
+
+        foreach (var issue in issues.EnumerateArray())
+        {
+            var id = Text(issue, "id");
+            var blocking = Text(issue, "severity") == "error";
+
+            // The first problem of each kind wins, and they arrive most serious
+            // first, so this is the one worth naming.
+            if (id.StartsWith("adapter", StringComparison.Ordinal) && adapter is null)
+            {
+                adapter = Text(issue, "summary");
+                adapterBlocking = blocking;
+            }
+            else if (id.StartsWith("vbcable", StringComparison.Ordinal) && cable is null)
+            {
+                cable = Text(issue, "summary");
+                cableBlocking = blocking;
+            }
+        }
+
+        Mark(SetupAdapterStatus, adapter, adapterBlocking);
+        Mark(SetupCableStatus, cable, cableBlocking);
+
+        void Mark(TextBlock target, string? text, bool blocking)
+        {
+            if (text is null)
+            {
+                target.Visibility = Visibility.Collapsed;
+                return;
+            }
+
+            target.Text = text;
+            target.Foreground = Brush(blocking
+                ? "SystemFillColorCriticalBrush"
+                : "SystemFillColorCautionBrush");
+            target.Visibility = Visibility.Visible;
+        }
+    }
+
+    /// <summary>Keeps what the device published, so codec settings can be judged against it.</summary>
+    private void RememberCapabilities(JsonElement message)
+    {
+        if (!message.TryGetProperty("sink", out var sink) || sink.ValueKind != JsonValueKind.Object)
+        {
+            return;
+        }
+
+        static IReadOnlyList<T> Numbers<T>(JsonElement parent, string name, Func<JsonElement, T> read)
+        {
+            if (!parent.TryGetProperty(name, out var array) || array.ValueKind != JsonValueKind.Array)
+            {
+                return Array.Empty<T>();
+            }
+            return array.EnumerateArray()
+                .Where(item => item.ValueKind == JsonValueKind.Number)
+                .Select(read)
+                .ToList();
+        }
+
+        static int? Optional(JsonElement parent, string name) =>
+            parent.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number
+                ? value.GetInt32()
+                : null;
+
+        _capabilities = new DeviceEnvelope(
+            Numbers(sink, "rates", item => item.GetInt32()),
+            Numbers(sink, "frameMs", item => item.GetDouble()),
+            Optional(sink, "octetsMin"),
+            Optional(sink, "octetsMax"));
+
+        RefreshCodecWarnings();
+    }
+
+    /// <summary>
+    /// Judges one codec value against what the connected headphones published.
+    /// </summary>
+    /// <remarks>
+    /// Three answers rather than two, because "the device did not list it" and
+    /// "the device published a range that excludes it" are genuinely different.
+    /// The first is a value worth trying on a device whose PAC records are
+    /// incomplete - plenty are. The second will be refused, and saying so before
+    /// the next connection saves the user a reconnect that ends in an error.
+    /// </remarks>
+    private Fit JudgeCodecValue(string key, string value)
+    {
+        // Nothing connected means nothing to contradict. Colouring settings
+        // against a device that is not there would tell the user their
+        // configuration is wrong for headphones they are not using.
+        if (_capabilities is not { } device)
+        {
+            return Fit.Supported;
+        }
+
+        switch (key)
+        {
+            case "rate_hz":
+                if (!int.TryParse(value, out var rate)) return Fit.Supported;
+                if (device.Rates.Contains(rate)) return Fit.Supported;
+                // LC3 itself is defined only to 48 kHz. Anything above that has
+                // no encoder behind it, whatever a device might claim.
+                return rate > 48_000 ? Fit.Refused : Fit.Doubtful;
+
+            case "frame_ms":
+                if (!double.TryParse(value, System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out var frame))
+                    return Fit.Supported;
+                return device.FrameMs.Any(supported => Math.Abs(supported - frame) < 0.01)
+                    ? Fit.Supported
+                    : Fit.Refused;
+
+            case "octets":
+                if (!int.TryParse(value, out var octets)) return Fit.Supported;
+                if (device.OctetsMin is not { } min || device.OctetsMax is not { } max)
+                    return Fit.Doubtful;
+                return octets >= min && octets <= max ? Fit.Supported : Fit.Refused;
+
+            default:
+                return Fit.Supported;
+        }
+    }
+
+    /// <summary>Colours one codec control according to what the device will accept.</summary>
+    private void ApplyCodecWarning(string key, string value, TextBlock note)
+    {
+        _codecValues[key] = value;
+
+        switch (JudgeCodecValue(key, value))
+        {
+            case Fit.Refused:
+                note.Text = Loc.T("codec.refused");
+                note.Foreground = Brush("SystemFillColorCriticalBrush");
+                note.Visibility = Visibility.Visible;
+                break;
+
+            case Fit.Doubtful:
+                note.Text = Loc.T("codec.doubtful");
+                note.Foreground = Brush("SystemFillColorCautionBrush");
+                note.Visibility = Visibility.Visible;
+                break;
+
+            default:
+                // Nothing to say. An always-present "this is fine" line trains
+                // people to stop reading the place the warnings appear.
+                note.Visibility = Visibility.Collapsed;
+                break;
+        }
+    }
+
+    /// <summary>Re-judges every codec control, after connecting or after an edit.</summary>
+    private void RefreshCodecWarnings()
+    {
+        foreach (var (key, note) in _codecNotes)
+        {
+            if (_codecValues.TryGetValue(key, out var value))
+            {
+                ApplyCodecWarning(key, value, note);
+            }
+        }
+    }
+
     private void OnAdapter(JsonElement message)
     {
         _adapterOn = message.GetProperty("on").GetBoolean();
@@ -1033,6 +2015,19 @@ public sealed partial class MainWindow : Window
             : Loc.T("status.adapter_off");
 
         AdapterDetail.Text = detail;
+
+        // The switch has to follow what actually happened, not what was asked
+        // for. Refusing to open an adapter that is still on the Microsoft stack
+        // used to leave the toggle sitting at On above the words "the adapter is
+        // off" - which reads as the app being confused rather than as a
+        // refusal, and invites the user to keep pressing it.
+        if (AdapterSwitch.IsOn != _adapterOn)
+        {
+            _suppressToggle = true;
+            AdapterSwitch.IsOn = _adapterOn;
+            _suppressToggle = false;
+        }
+
         Append(_adapterOn ? $"Bluetooth on - {detail}" : "Bluetooth off.");
 
         if (_adapterOn)
@@ -1132,10 +2127,37 @@ public sealed partial class MainWindow : Window
             };
         }).ToList();
 
-        _paired.Clear();
-        foreach (var row in rows)
+        // Updated in place rather than cleared and refilled. Clearing tears down
+        // every container the list view has built and rebuilds them in the same
+        // frame, and a row that arrives mid-teardown draws with nothing in it -
+        // an icon, a gap and two buttons, which is what a "bugged" device row
+        // actually is.
+        for (var index = _paired.Count - 1; index >= 0; index--)
         {
-            _paired.Add(row);
+            if (!rows.Any(row => AddressesMatch(row.Address, _paired[index].Address)))
+            {
+                _paired.RemoveAt(index);
+            }
+        }
+        for (var index = 0; index < rows.Count; index++)
+        {
+            var existing = _paired
+                .Select((row, at) => (row, at))
+                .FirstOrDefault(pair => AddressesMatch(pair.row.Address, rows[index].Address),
+                                (null!, -1));
+            if (existing.at < 0)
+            {
+                _paired.Insert(Math.Min(index, _paired.Count), rows[index]);
+            }
+            else if (existing.at != index)
+            {
+                _paired.Move(existing.at, index);
+                _paired[index] = rows[index];
+            }
+            else if (!Equals(existing.row, rows[index]))
+            {
+                _paired[index] = rows[index];
+            }
         }
 
         var pairedAddresses = rows.Select(row => row.Address).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -1249,6 +2271,38 @@ public sealed partial class MainWindow : Window
 
     // --------------------------------------------------------------- settings
 
+    /// <summary>Shows, on every page, that a connection is being worked on.</summary>
+    /// <remarks>
+    /// Three places said this and none of them said it everywhere: the device
+    /// row went to "Connecting…", the log printed a line that scrolls away, and
+    /// the settings page - the page somebody is looking at when a change causes
+    /// the reconnect - said nothing at all. So a reconnect after a settings
+    /// change looked like the app having stopped responding.
+    /// </remarks>
+    private void ShowReconnecting(bool active, string? detail = null)
+    {
+        Busy.IsActive = active;
+
+        if (active)
+        {
+            StabilityMetric.Foreground = Brush("SystemFillColorCautionBrush");
+            StabilityMetric.Text = detail ?? Loc.T("metrics.reconnecting");
+
+            SettingsNotice.Severity = InfoBarSeverity.Informational;
+            SettingsNotice.Message = detail ?? Loc.T("settings.reconnecting");
+            SettingsNotice.ActionButton = null;
+            SettingsNotice.IsOpen = true;
+            _reconnectNoticeOwned = true;
+            return;
+        }
+
+        if (_reconnectNoticeOwned)
+        {
+            _reconnectNoticeOwned = false;
+            SettingsNotice.IsOpen = false;
+        }
+    }
+
     /// <summary>
     /// Says, while something is connected, that stream settings need a reconnect
     /// - and offers one.
@@ -1280,21 +2334,30 @@ public sealed partial class MainWindow : Window
 
     private static readonly SectionDefinition[] Sections =
     {
-        new("playback", "audio", 2, "section.playback", "section.playback.sub", "\uE767", Accent(45, 140, 255),
-            new[] { "playback_source", "audio_mode", "swap_channels", "gain" }),
+        // In the application panel rather than beside the codec, and first in
+        // it. These are the controls somebody reaches for while listening -
+        // source, channels, balance, volume - and they were sitting under two
+        // panels of radio parameters nobody touches twice. Kept first in this
+        // array because that is what puts it at the top of its panel.
+        new("playback", "application", 2, "section.playback", "section.playback.sub", "\uE767", Accent(45, 140, 255),
+            new[] { "playback_source", "audio_mode", "swap_channels", "balance", "gain" }),
         new("codec", "audio", 0, "section.codec", "section.codec.sub", "\uE8D6", Accent(145, 102, 224),
             new[] { "rate_hz", "frame_ms", "octets" }),
         new("radio", "audio", 0, "section.radio", "section.radio.sub", "\uE701", Accent(0, 168, 120),
-            new[] { "phy", "retransmissions", "max_latency_ms", "presentation_delay_ms" }),
+            new[] { "phy", "retransmissions", "max_latency_ms", "presentation_delay_ms",
+                    "idle_link_latency" }),
         new("connection", "connection", 1, "section.connection", "section.connection.sub", "\uE702", Accent(245, 158, 11),
-            new[] { "reconnect_enabled", "startup_reconnect_enabled", "reconnect_interval_s", "reconnect_window_min", "idle_timeout_min", "device" }),
+            new[] { "device", "reconnect_enabled", "reconnect_interval_s", "reconnect_window_min",
+                    "startup_reconnect_enabled", "link_timeout_s" }),
+        new("sharing", "connection", 1, "section.sharing", "section.sharing.sub", "", Accent(99, 102, 241),
+            new[] { "multipoint_yield_enabled", "multipoint_yield_s", "idle_timeout_min" }),
         new("microphone", "connection", 1, "section.microphone", "section.microphone.sub", "\uE720", Accent(224, 82, 141),
             new[] { "microphone_mode", "microphone_quality", "microphone_target",
                     "microphone_gain", "monitor_enabled", "monitor_source", "monitor_mode", "monitor_gain" }),
         new("application", "application", 2, "section.application", "section.application.sub", "\uE8A7", Accent(20, 184, 166),
             new[] { "run_in_background", "start_with_windows" }),
         new("diagnostics", "application", 2, "section.tuning", "section.tuning.sub", "\uE713", Accent(100, 116, 139),
-            new[] { "diagnostics", "command_style" }),
+            new[] { "link_metrics", "battery_poll_min", "diagnostics", "command_style" }),
     };
 
     private static readonly SectionDefinition OtherSection = new(
@@ -1327,6 +2390,7 @@ public sealed partial class MainWindow : Window
         _settingCards.Clear();
         _settingCardPanels.Clear();
         _savedMarkers.Clear();
+        _codecNotes.Clear();
         PresetHost.Children.Clear();
         _presetBox = null;
         LanguageHost.Children.Clear();
@@ -1335,6 +2399,12 @@ public sealed partial class MainWindow : Window
         var knobs = message.GetProperty("knobs")
             .EnumerateArray()
             .ToDictionary(k => Text(k, "key"));
+
+        _settingValues.Clear();
+        foreach (var (key, knob) in knobs)
+        {
+            _settingValues[key] = Text(knob, "value");
+        }
         if (knobs.TryGetValue("language", out var languageKnob))
         {
             Loc.SetLanguage(Text(languageKnob, "value"));
@@ -1346,6 +2416,9 @@ public sealed partial class MainWindow : Window
             && Text(backgroundKnob, "value") is "true" or "1";
         _startupReconnectEnabled = !knobs.TryGetValue("startup_reconnect_enabled", out var startupReconnectKnob)
             || Text(startupReconnectKnob, "value") is "true" or "1";
+        _preferredDevice = knobs.TryGetValue("device", out var deviceKnob)
+            ? Text(deviceKnob, "value")
+            : "";
 
         var placed = new HashSet<string>();
 
@@ -1495,20 +2568,13 @@ public sealed partial class MainWindow : Window
             },
         });
 
-        var labels = new StackPanel { Spacing = 0, VerticalAlignment = VerticalAlignment.Center };
-        labels.Children.Add(new TextBlock
-        {
-            Text = Loc.T("settings.main_preset"), FontSize = 14,
-            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
-            TextWrapping = TextWrapping.Wrap,
-        });
-        labels.Children.Add(new TextBlock
-        {
-            Text = Description("preset", description), FontSize = 11,
-            Foreground = Brush("TextFillColorSecondaryBrush"),
-            TextWrapping = TextWrapping.NoWrap, TextTrimming = TextTrimming.CharacterEllipsis,
-            MaxLines = 1,
-        });
+        // The same shape as every other setting: a name and a question mark.
+        // The description used to sit underneath, trimmed to one line with an
+        // ellipsis - which meant the sentence explaining the most important
+        // control on the page was the one sentence nobody could finish reading.
+        var labels = NameWithHelp(Loc.T("settings.main_preset"),
+            BuildKnobHelp("preset", description, scope), 14,
+            Microsoft.UI.Text.FontWeights.SemiBold);
         Grid.SetColumn(labels, 1);
         grid.Children.Add(labels);
 
@@ -1526,8 +2592,6 @@ public sealed partial class MainWindow : Window
         _presetBox.VerticalAlignment = VerticalAlignment.Center;
         _presetBox.HorizontalAlignment = HorizontalAlignment.Stretch;
         _presetBox.MinWidth = 190;
-        ToolTipService.SetToolTip(_presetBox,
-            $"{Description("preset", description)}\n{Scope(scope)}");
         control.Children.Add(_presetBox);
         var presetMarker = new TextBlock
         {
@@ -1648,6 +2712,17 @@ public sealed partial class MainWindow : Window
         Grid.SetColumnSpan(AboutStackCard, compact ? 2 : 1);
     }
 
+    private void AboutTimingGridSizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        var compact = e.NewSize.Width > 0 && e.NewSize.Width < 800;
+        Grid.SetRow(AboutTimingCard, 0);
+        Grid.SetColumn(AboutTimingCard, 0);
+        Grid.SetColumnSpan(AboutTimingCard, compact ? 2 : 1);
+        Grid.SetRow(AboutSharingCard, compact ? 1 : 0);
+        Grid.SetColumn(AboutSharingCard, compact ? 0 : 1);
+        Grid.SetColumnSpan(AboutSharingCard, compact ? 2 : 1);
+    }
+
     private FrameworkElement SettingsPanel(string titleKey, string subtitleKey,
         SolidColorBrush accent, StackPanel content)
     {
@@ -1740,26 +2815,16 @@ public sealed partial class MainWindow : Window
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
-        var labels = new StackPanel { Spacing = 2, VerticalAlignment = VerticalAlignment.Center };
-        labels.Children.Add(new TextBlock { Text = Label(key), FontSize = 14, TextWrapping = TextWrapping.Wrap });
-        var tradeoff = Tradeoff(key);
-        labels.Children.Add(new TextBlock
-        {
-            Text = string.IsNullOrEmpty(tradeoff) ? Description(key, description) : $"{Description(key, description)}\n{tradeoff}",
-            FontSize = 12,
-            TextWrapping = TextWrapping.Wrap,
-            Foreground = Brush("TextFillColorSecondaryBrush"),
-        });
-        // Saying when a change takes effect is the whole reason the backend
-        // reports a scope. Leaving it out is how a control gets a reputation
-        // for doing nothing.
-        labels.Children.Add(new TextBlock
-        {
-            Text = Scope(scope),
-            FontSize = 11,
-            Foreground = Brush("TextFillColorTertiaryBrush"),
-            TextWrapping = TextWrapping.Wrap,
-        });
+        // The name, and a question mark that holds everything else.
+        //
+        // Three stacked paragraphs under every single setting made the page
+        // roughly four times taller than the controls needed and turned it into
+        // something to be scrolled past rather than read. The explanation still
+        // matters - especially "this only takes effect after reconnecting",
+        // which is the whole reason the backend reports a scope at all - so it
+        // moves one click away rather than being deleted.
+        var labels = NameWithHelp(Label(key), BuildKnobHelp(key, description, scope), 14,
+            Microsoft.UI.Text.FontWeights.Normal, BuildPowerHint(key));
         Grid.SetColumn(labels, 0);
         grid.Children.Add(labels);
 
@@ -1774,7 +2839,16 @@ public sealed partial class MainWindow : Window
                 ("robust", Loc.T("choice.robust")),
                 ("custom", Loc.T("choice.custom")),
             }),
-            "rate_hz" => Choice(key, value, new[] { "48000", "32000", "24000", "16000" }),
+            // Every rate LC3 defines, so a better headset than the author's is
+            // not limited by a list written against one device. 48 kHz is the
+            // codec's ceiling - Bluetooth LE Audio does not define LC3 above it,
+            // whatever a driver specification sheet says about the speakers - so
+            // there is nothing honest to put beyond it. Anything the connected
+            // device did not publish is marked rather than hidden: PAC records
+            // are frequently incomplete, and a value worth trying should be
+            // reachable.
+            "rate_hz" => Choice(key, value, new[]
+                { "48000", "44100", "32000", "24000", "16000", "8000" }),
             "frame_ms" => Choice(key, value, new[] { "10", "7.5" }),
             "phy" => Choice(key, value, new[] { "2M", "1M" }),
             "octets" => SliderNumber(key, value, 20, 155, 1, Loc.T("slider.economical"), Loc.T("slider.detail")),
@@ -1782,9 +2856,20 @@ public sealed partial class MainWindow : Window
             "max_latency_ms" => SliderNumber(key, value, 5, 200, 5, Loc.T("slider.lower_latency"), Loc.T("slider.more_headroom")),
             "presentation_delay_ms" => SliderNumber(key, value, 10, 200, 5, Loc.T("slider.faster"), Loc.T("slider.stable")),
             "gain" => SliderNumber(key, value, 0, 2, 0.05, Loc.T("slider.silent"), Loc.T("slider.boost")),
+            "balance" => SliderNumber(key, value, -50, 50, 1, Loc.T("slider.left"), Loc.T("slider.right")),
+            "link_timeout_s" => SliderNumber(key, value, 2, 30, 1, Loc.T("slider.drop_sooner"), Loc.T("slider.survive_range")),
+            "battery_poll_min" => SliderNumber(key, value, 0, 60, 1, Loc.T("slider.never_ask"), Loc.T("slider.rarely")),
+            "idle_link_latency" => SliderNumber(key, value, 0, 30, 1, Loc.T("slider.untouched"), Loc.T("slider.save_battery")),
             "idle_timeout_min" => SliderNumber(key, value, 0, 120, 1, Loc.T("slider.never"), Loc.T("slider.longer")),
             "reconnect_interval_s" => SliderNumber(key, value, 1, 60, 1, Loc.T("slider.often"), Loc.T("slider.gentle")),
             "reconnect_window_min" => SliderNumber(key, value, 0, 60, 1, Loc.T("slider.unlimited"), Loc.T("slider.limited")),
+            "multipoint_yield_s" => SliderNumber(key, value, 2, 60, 1, Loc.T("slider.share_sooner"), Loc.T("slider.hold_longer")),
+            "link_metrics" => Choice(key, value, new[]
+            {
+                ("off", Loc.T("choice.metrics_off")),
+                ("signal", Loc.T("choice.metrics_signal")),
+                ("full", Loc.T("choice.metrics_full")),
+            }),
             "audio_mode" => Choice(key, value, new[]
             {
                 ("stereo", Loc.T("choice.stereo")),
@@ -1793,6 +2878,10 @@ public sealed partial class MainWindow : Window
             }),
             "playback_source" or "monitor_source" when dynamicOptions.Length > 0 =>
                 Choice(key, value, dynamicOptions),
+            // Built from the paired list rather than typed. An address entered by
+            // hand is one transposed character away from silently matching
+            // nothing, and a setting that fails that quietly is worse than none.
+            "device" => Choice(key, value, PreferredDeviceOptions(value)),
             "microphone_mode" => Choice(key, value, new[]
             {
                 ("off", Loc.T("choice.mic_off")),
@@ -1825,6 +2914,7 @@ public sealed partial class MainWindow : Window
                 ("class-interface", Loc.T("choice.class_interface")),
             }),
             "reconnect_enabled" or "startup_reconnect_enabled" or "diagnostics" or "swap_channels" or
+                "multipoint_yield_enabled" or
                 "monitor_enabled" or
                 "run_in_background" or "start_with_windows" => Switch(key, value),
             _ => TextField(key, value),
@@ -1837,6 +2927,16 @@ public sealed partial class MainWindow : Window
             ToolTipService.SetToolTip(control, Loc.T("settings.custom_on_edit"));
 
         control.VerticalAlignment = VerticalAlignment.Center;
+
+        // A ToggleSwitch asks for 32 pixels of height and a width wide enough
+        // for a header it does not have. Left alone it decides how tall every
+        // row containing one is, and how far from its own label it sits.
+        if (control is ToggleSwitch toggleControl)
+        {
+            toggleControl.MinWidth = 0;
+            toggleControl.MinHeight = 0;
+            toggleControl.VerticalContentAlignment = VerticalAlignment.Center;
+        }
 
         // A tick beside the control that just saved. A page-wide banner cannot
         // say which of ten settings it meant, which is most of why saving felt
@@ -1852,35 +2952,123 @@ public sealed partial class MainWindow : Window
         _savedMarkers[key] = saved;
         RestorePendingMarker(key, saved);
 
-        // Controls with variable or translated text always live below their
-        // explanation. Keeping a ComboBox beside a paragraph squeezed the
-        // paragraph into a different number of lines and made opening a menu
-        // look as if the whole card had been rearranged.
-        var wide = control is ComboBox or TextBox or ToggleSwitch || key is "language" or
-            "octets" or "retransmissions" or "max_latency_ms" or
-            "presentation_delay_ms" or "gain" or "idle_timeout_min" or
-            "reconnect_interval_s" or "reconnect_window_min" or "microphone_gain" or "monitor_gain";
-        var column = new StackPanel
+        // Codec values are the only ones a device can refuse outright, so they
+        // are the only ones that carry this. It updates when capabilities
+        // arrive and when the value changes, so it can never describe a value
+        // that is no longer selected.
+        TextBlock? fitNote = null;
+        if (CodecJudgedKeys.Contains(key))
         {
-            Spacing = 2,
-            HorizontalAlignment = wide ? HorizontalAlignment.Stretch : HorizontalAlignment.Right,
-        };
-        column.Children.Add(control);
-        column.Children.Add(saved);
+            fitNote = new TextBlock
+            {
+                FontSize = 11,
+                TextWrapping = TextWrapping.Wrap,
+                Visibility = Visibility.Collapsed,
+                HorizontalAlignment = HorizontalAlignment.Left,
+            };
+            _codecNotes[key] = fitNote;
+        }
 
-        if (wide)
-        {
-            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            Grid.SetColumnSpan(labels, 2);
-            Grid.SetRow(column, 1);
-            Grid.SetColumnSpan(column, 2);
-        }
-        else
-        {
-            Grid.SetColumn(column, 1);
-        }
+        // Only controls that genuinely need the width take a row of their own.
+        //
+        // Everything used to, because a ComboBox beside a three-line paragraph
+        // re-wrapped the paragraph and made opening a menu look as if the card
+        // had rearranged itself. The paragraph now lives behind the question
+        // mark, so a name and a menu sit on one line and the page reads as a
+        // list of settings rather than a wall of prose.
+        //
+        // Asked of the control rather than looked up in a list of keys kept
+        // somewhere else: that list had to be edited every time a slider was
+        // added, and forgetting produced a control too narrow to use with
+        // nothing to explain why.
+        var wide = (control as FrameworkElement)?.Tag as string == NeedsFullWidth;
+        // The saved marker goes beside a control that shares its row, and below
+        // one that does not.
+        //
+        // It was always below, and it keeps its space when invisible so the
+        // layout does not jump the moment it appears. On a one-line row that
+        // reserved space sat under the control and pushed it above the middle
+        // of the row - every switch and menu ended up a few pixels higher than
+        // the label it belonged to, which reads as sloppiness rather than as
+        // the side effect of an invisible element it is.
+        // The marker sits on the name row, at the far right, and shares nothing
+        // with the control.
+        //
+        // It keeps its width while invisible, so the layout does not jump when
+        // it appears - which means wherever it is put, it takes that space from
+        // something. In front of the control it indented every menu; behind it,
+        // it cropped every slider short of the card edge. On the name row there
+        // is space going spare, and the control below can run the full width.
+        var column = new Grid { VerticalAlignment = VerticalAlignment.Center };
+        column.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        column.Children.Add(control);
+
+        saved.HorizontalAlignment = HorizontalAlignment.Right;
+        saved.VerticalAlignment = VerticalAlignment.Center;
+        Grid.SetColumn(saved, 1);
+        labels.Children.Add(saved);
+
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         grid.Children.Add(column);
+
+        // Beside the label when there is room for both, underneath when there
+        // is not.
+        //
+        // Three panels side by side leave each card about four hundred pixels
+        // wide, and a name plus a menu does not fit in that: the name wrapped to
+        // three lines and broke mid-word. Rather than pick one layout and make
+        // the other window size look bad, the row measures itself - the same
+        // thing the preset card and the About page already do.
+        void Arrange(double width)
+        {
+            // Room for the longest name in this card plus a usable menu beside
+            // it. Three panels inside a page capped at 1500 leave each card a
+            // little over four hundred, which is enough - the previous figure of
+            // 500 was above that, so every row stacked at the one window size
+            // the layout was designed for and the page became a column of
+            // full-width boxes.
+            const double Together = 380;
+            var stacked = wide || width < Together;
+
+            Grid.SetColumnSpan(labels, stacked ? 2 : 1);
+            Grid.SetRow(column, stacked ? 1 : 0);
+            Grid.SetColumn(column, stacked ? 0 : 1);
+            Grid.SetColumnSpan(column, stacked ? 2 : 1);
+            column.Margin = stacked ? new Thickness(0, 6, 0, 0) : new Thickness(0);
+            column.HorizontalAlignment = stacked
+                ? HorizontalAlignment.Stretch
+                : HorizontalAlignment.Right;
+
+            if (control is ComboBox or TextBox)
+            {
+                control.HorizontalAlignment = stacked
+                    ? HorizontalAlignment.Stretch
+                    : HorizontalAlignment.Right;
+                control.MinWidth = stacked ? 0 : 150;
+                control.MaxWidth = stacked ? double.PositiveInfinity : 280;
+            }
+        }
+
+        grid.SizeChanged += (_, e) => Arrange(e.NewSize.Width);
+        Arrange(wide ? 0 : 420);
+
+        // The capability warning gets its own full-width row underneath.
+        //
+        // It reads as a sentence, not a label, and a sentence wrapped into the
+        // narrow right-hand column beside a dropdown comes out four words at a
+        // time. It also has to be visible without opening anything: this is the
+        // one thing on the page that says a value will be refused, and a
+        // warning behind a question mark is a warning nobody sees in time.
+        if (fitNote is not null)
+        {
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            Grid.SetRow(fitNote, grid.RowDefinitions.Count - 1);
+            Grid.SetColumnSpan(fitNote, 2);
+            fitNote.Margin = new Thickness(0, 4, 0, 0);
+            grid.Children.Add(fitNote);
+            ApplyCodecWarning(key, value, fitNote);
+        }
 
         return new Border
         {
@@ -1890,6 +3078,45 @@ public sealed partial class MainWindow : Window
             Child = grid,
         };
     }
+
+    /// <summary>The paired headphones, plus "whichever is nearest".</summary>
+    private (string Value, string Label)[] PreferredDeviceOptions(string current)
+    {
+        var options = new List<(string, string)> { ("", Loc.T("choice.device_any")) };
+        options.AddRange(_paired.Select(row => (row.Address, $"{row.Name}  ·  {row.Address}")));
+
+        // A device paired on this machine but not currently in the list would
+        // otherwise be dropped from the menu, and selecting anything else would
+        // silently discard the saved choice.
+        if (current.Length > 0 && !options.Any(option =>
+                string.Equals(option.Item1, current, StringComparison.OrdinalIgnoreCase)))
+        {
+            options.Add((current, current));
+        }
+
+        return options.ToArray();
+    }
+
+    /// <summary>
+    /// How one value of a setting is written on its own control.
+    /// </summary>
+    /// <remarks>
+    /// So advice about a setting can name the option the way the menu does. A
+    /// note saying to choose "mono" when the menu offers "Mono - one channel"
+    /// leaves the reader matching strings by eye.
+    /// </remarks>
+    private static string ValueLabel(string key, string value) => (key, value) switch
+    {
+        ("audio_mode", "mono") => Loc.T("choice.mono"),
+        ("audio_mode", "stereo") => Loc.T("choice.stereo"),
+        ("audio_mode", "legacy") => Loc.T("choice.legacy"),
+        ("microphone_mode", "off") => Loc.T("choice.mic_off"),
+        ("microphone_mode", "on") => Loc.T("choice.mic_on"),
+        ("frame_ms", _) => $"{value} ms",
+        ("phy", _) => value,
+        // Numbers speak for themselves; the unit is already in the label.
+        _ => value,
+    };
 
     private static string Label(string key) => Loc.T("setting." + key);
 
@@ -1939,6 +3166,241 @@ public sealed partial class MainWindow : Window
         _ => key,
     };
 
+    /// <summary>A setting name with its help button, laid out so neither crowds the other.</summary>
+    /// <remarks>
+    /// A grid rather than a horizontal stack. A stack gives every child its
+    /// natural width and lets the row overflow, so a name longer than the column
+    /// pushed the question mark off the edge and it was silently clipped - the
+    /// explanation was there and simply unreachable. Here the name takes the
+    /// slack and wraps; the button always keeps its place.
+    /// </remarks>
+    private static Grid NameWithHelp(string name, FrameworkElement help, double fontSize,
+        Windows.UI.Text.FontWeight weight, FrameworkElement? power = null)
+    {
+        // Auto for the name, star for the space after it, so the buttons sit
+        // immediately beside the text rather than at the far right of the
+        // column - out there they stop reading as "help about this setting" and
+        // start reading as stray controls.
+        //
+        // The catch is that an Auto column asks for the width the text wants on
+        // one line, so a long name in a narrow card overflowed and was clipped:
+        // "Playback capture sc", with the question mark sliced in half. The
+        // measured width below is what stops that. It cannot be expressed
+        // declaratively, because the answer depends on how wide the card turned
+        // out to be.
+        var row = new Grid { ColumnSpacing = 6, VerticalAlignment = VerticalAlignment.Center };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        var text = new TextBlock
+        {
+            Text = name,
+            FontSize = fontSize,
+            FontWeight = weight,
+            TextWrapping = TextWrapping.Wrap,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        row.Children.Add(text);
+
+        var buttons = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 2,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        buttons.Children.Add(help);
+        if (power is not null)
+        {
+            buttons.Children.Add(power);
+        }
+
+        Grid.SetColumn(buttons, 1);
+        row.Children.Add(buttons);
+
+        // Give the name everything except the room the buttons need. Without a
+        // ceiling the Auto column reports the width of the whole name on one
+        // line and the row is clipped instead of wrapping.
+        row.SizeChanged += (_, e) =>
+        {
+            var reserved = (power is null ? 1 : 2) * 22 + 12;
+            var available = e.NewSize.Width - reserved;
+            text.MaxWidth = available > 40 ? available : 40;
+        };
+
+        return row;
+    }
+
+    /// <summary>
+    /// The battery icon beside a setting, and what it costs the radio.
+    /// </summary>
+    /// <remarks>
+    /// Shown only where there is something true to say. Most settings do not
+    /// touch the radio at all, and a battery icon on all of them would make the
+    /// few that matter invisible among the ones that do not.
+    ///
+    /// The figure is reserved airtime, computed from the configuration on the
+    /// page - not a battery measurement, which this program has no way to take.
+    /// The flyout says so, because a number that looks measured and is not is
+    /// worse than no number.
+    /// </remarks>
+    private FrameworkElement? BuildPowerHint(string key)
+    {
+        if (!PowerEstimate.Affects(key, _settingValues))
+        {
+            return null;
+        }
+
+        var content = new StackPanel { Spacing = 8, MaxWidth = 320 };
+        content.Children.Add(new TextBlock
+        {
+            Text = Loc.T("power.title"),
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            TextWrapping = TextWrapping.Wrap,
+        });
+
+        var saving = PowerEstimate.SavingIfCheapest(_settingValues, key);
+        if (saving is { } share)
+        {
+            var cheapest = PowerEstimate.Cheapest(key);
+            content.Children.Add(new TextBlock
+            {
+                Text = share < 0.005
+                    ? Loc.T("power.already_cheapest")
+                    : cheapest is null
+                        ? Loc.T("power.saving", $"{share * 100:0}")
+                        : Loc.T("power.saving_named", ValueLabel(key, cheapest), $"{share * 100:0}"),
+                TextWrapping = TextWrapping.Wrap,
+            });
+
+            var duty = PowerEstimate.Airtime(_settingValues).DutyCycle;
+            content.Children.Add(new TextBlock
+            {
+                Text = Loc.T("power.duty", $"{Math.Min(duty, 1.0) * 100:0.0}"),
+                FontSize = 12,
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = Brush("TextFillColorSecondaryBrush"),
+            });
+        }
+
+        if (PowerEstimate.Note(key, _settingValues) is { } noteKey)
+        {
+            content.Children.Add(new TextBlock
+            {
+                Text = Loc.T(noteKey),
+                TextWrapping = TextWrapping.Wrap,
+            });
+        }
+
+        content.Children.Add(new Border
+        {
+            Height = 1,
+            Background = Brush("CardStrokeColorDefaultBrush"),
+            Margin = new Thickness(0, 2, 0, 2),
+        });
+        content.Children.Add(new TextBlock
+        {
+            Text = Loc.T("power.caveat"),
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = Brush("TextFillColorTertiaryBrush"),
+        });
+
+        var button = new Button
+        {
+            // Battery10: the only one of the battery glyphs with enough fill to
+            // still look like a battery rather than an empty rounded rectangle
+            // at this size.
+            Content = new FontIcon { Glyph = "\uE85A", FontSize = 13 },
+            Padding = new Thickness(0),
+            Width = 20,
+            Height = 20,
+            MinWidth = 20,
+            CornerRadius = new CornerRadius(10),
+            Background = Brush("SubtleFillColorTransparentBrush"),
+            BorderThickness = new Thickness(0),
+            Foreground = Brush("TextFillColorTertiaryBrush"),
+            VerticalAlignment = VerticalAlignment.Center,
+            Flyout = new Flyout { Content = content },
+        };
+
+        AutomationProperties.SetName(button, Loc.T("power.title"));
+        ToolTipService.SetToolTip(button, Loc.T("power.title"));
+        return button;
+    }
+
+    /// <summary>
+    /// The question mark beside a setting name, and the explanation behind it.
+    /// </summary>
+    /// <remarks>
+    /// A flyout rather than a tooltip: a tooltip cannot be opened deliberately,
+    /// disappears while it is being read, and never appears at all by keyboard
+    /// or touch. This one opens on click, stays until dismissed, and is
+    /// reachable by tab - so the explanation is genuinely available rather than
+    /// technically present.
+    ///
+    /// The scope line is last and separated, because it answers a different
+    /// question from the rest: not "what does this do" but "why has nothing
+    /// changed yet".
+    /// </remarks>
+    private FrameworkElement BuildKnobHelp(string key, string description, string scope)
+    {
+        var content = new StackPanel { Spacing = 8, MaxWidth = 320 };
+        content.Children.Add(new TextBlock
+        {
+            Text = Description(key, description),
+            TextWrapping = TextWrapping.Wrap,
+        });
+
+        var tradeoff = Tradeoff(key);
+        if (!string.IsNullOrEmpty(tradeoff))
+        {
+            content.Children.Add(new TextBlock
+            {
+                Text = tradeoff,
+                TextWrapping = TextWrapping.Wrap,
+                FontSize = 12,
+                Foreground = Brush("TextFillColorSecondaryBrush"),
+            });
+        }
+
+        content.Children.Add(new Border
+        {
+            Height = 1,
+            Background = Brush("CardStrokeColorDefaultBrush"),
+            Margin = new Thickness(0, 2, 0, 2),
+        });
+        content.Children.Add(new TextBlock
+        {
+            Text = Scope(scope),
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 12,
+            Foreground = Brush("TextFillColorTertiaryBrush"),
+        });
+
+        var button = new Button
+        {
+            Content = new FontIcon { Glyph = "\uE9CE", FontSize = 12 },
+            Padding = new Thickness(0),
+            Width = 20,
+            Height = 20,
+            MinWidth = 20,
+            CornerRadius = new CornerRadius(10),
+            Background = Brush("SubtleFillColorTransparentBrush"),
+            BorderThickness = new Thickness(0),
+            Foreground = Brush("TextFillColorTertiaryBrush"),
+            VerticalAlignment = VerticalAlignment.Center,
+            Flyout = new Flyout { Content = content },
+        };
+
+        // Named for screen readers and for the hover tooltip, so the button is
+        // not an unlabelled circle to anyone who cannot see the glyph.
+        AutomationProperties.SetName(button, Loc.T("settings.explain", Label(key)));
+        ToolTipService.SetToolTip(button, Loc.T("settings.explain", Label(key)));
+
+        return button;
+    }
+
     private static string Tradeoff(string key)
     {
         var translated = Loc.T("trade." + key);
@@ -1980,7 +3442,12 @@ public sealed partial class MainWindow : Window
 
     private FrameworkElement LanguageControl(string value)
     {
-        var panel = new StackPanel { Spacing = 8, HorizontalAlignment = HorizontalAlignment.Stretch };
+        var panel = new StackPanel
+        {
+            Spacing = 8,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            Tag = NeedsFullWidth,
+        };
         var choices = Loc.Languages.ToArray();
         var box = StableComboBox();
         foreach (var language in choices)
@@ -2191,7 +3658,14 @@ public sealed partial class MainWindow : Window
             endpoints.Children.Add(middle);
         }
 
-        var panel = new StackPanel { Spacing = 0, HorizontalAlignment = HorizontalAlignment.Stretch };
+        var panel = new StackPanel
+        {
+            Spacing = 0,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            // A slider squeezed into whatever a translated label leaves over is
+            // too short to aim with, so it takes a row of its own.
+            Tag = NeedsFullWidth,
+        };
         panel.Children.Add(row);
         panel.Children.Add(endpoints);
 
@@ -2240,6 +3714,15 @@ public sealed partial class MainWindow : Window
     private async void ApplyFromControl(string key, string value)
     {
         if (_populating) return;
+
+        _settingValues[key] = value;
+
+        // Judged before it is sent, so the warning appears as the value is
+        // chosen rather than after the next reconnect fails.
+        if (_codecNotes.TryGetValue(key, out var note))
+        {
+            ApplyCodecWarning(key, value, note);
+        }
 
         if (PresetControlledKeys.Contains(key) && !_customPreset)
         {

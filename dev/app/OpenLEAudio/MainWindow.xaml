@@ -66,6 +66,39 @@
                         <muxc:InfoBar x:Name="SetupNotice" IsOpen="False" IsClosable="True"
                                       Severity="Informational" HorizontalAlignment="Stretch" />
 
+                        <!-- What has to be present before any of the numbered
+                             steps below can work. A missing Visual C++ runtime
+                             in particular kills the application at launch with
+                             no window and no message, so it is worth stating
+                             rather than leaving to be discovered. -->
+                        <Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                BorderThickness="1" CornerRadius="10" Padding="20">
+                            <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="16">
+                                <Border Width="34" Height="34" CornerRadius="17"
+                                        Background="{ThemeResource AccentFillColorDefaultBrush}"
+                                        VerticalAlignment="Top">
+                                    <FontIcon Glyph="&#xE9F9;" FontSize="16"
+                                              Foreground="{ThemeResource TextOnAccentFillColorPrimaryBrush}" />
+                                </Border>
+                                <StackPanel Grid.Column="1" Spacing="5">
+                                    <TextBlock Text="Requirements" FontSize="18" FontWeight="SemiBold" />
+                                    <TextBlock Text="Microsoft runtimes OpenLEAudio needs in order to run at all. The installer downloads only what is missing, into the dependencies directory next to the application."
+                                               TextWrapping="Wrap" LineHeight="20" />
+                                    <StackPanel x:Name="DependencyList" Spacing="4" Margin="0,4,0,0" />
+                                </StackPanel>
+                                <StackPanel Grid.Column="2" Spacing="8" MinWidth="170"
+                                            VerticalAlignment="Top">
+                                    <Button Content="Check again" Click="CheckDependenciesClicked"
+                                            HorizontalAlignment="Stretch" />
+                                    <Button x:Name="InstallDependenciesButton"
+                                            Content="Install missing" Tag="dependencies"
+                                            Click="SetupActionClicked" HorizontalAlignment="Stretch"
+                                            IsEnabled="False" />
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+
                         <Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                                 BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                                 BorderThickness="1" CornerRadius="10" Padding="20">
@@ -103,6 +136,12 @@
                                                TextWrapping="Wrap" LineHeight="20" />
                                     <HyperlinkButton Content="VB-CABLE website" NavigateUri="https://vb-audio.com/Cable/"
                                                      Padding="0" HorizontalAlignment="Left" />
+                                    <!-- Filled in from the same check that
+                                         raises the bar on the Devices page, so
+                                         the step that fixes a problem also says
+                                         that there is one. -->
+                                    <TextBlock x:Name="SetupCableStatus" Text="" FontSize="12"
+                                               TextWrapping="Wrap" Visibility="Collapsed" />
                                 </StackPanel>
                                  <StackPanel Grid.Column="2" Spacing="8" MinWidth="170">
                                     <Button Content="Install VB-CABLE" Tag="vbcable-install" Click="SetupActionClicked" HorizontalAlignment="Stretch" />
@@ -145,6 +184,8 @@
                                     <Button Content="Restore Windows driver" Tag="adapter-restore" Click="SetupActionClicked" />
                                     <Button Content="Driver status" Tag="adapter-status" Click="SetupActionClicked" />
                                 </StackPanel>
+                                <TextBlock x:Name="SetupAdapterStatus" Text="" FontSize="12"
+                                           TextWrapping="Wrap" Visibility="Collapsed" />
                                 <TextBlock Text="LE is checked from the controller generation and Windows device data. Final LE Audio compatibility is confirmed safely after switching by reading the controller's LE feature set and the headset's GATT PACS/ASCS services; unsupported codec or channel configurations are rejected before streaming."
                                            TextWrapping="Wrap" FontSize="12"
                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
@@ -172,7 +213,7 @@
             </ScrollViewer>
 
             <!-- ============================ ZAŘÍZENÍ ============================ -->
-            <Grid x:Name="DevicesPage" RowDefinitions="Auto,Auto,*,Auto" Padding="32,20,32,20"
+            <Grid x:Name="DevicesPage" RowDefinitions="Auto,Auto,Auto,*,Auto" Padding="32,20,32,20"
                   RowSpacing="16" MaxWidth="1500" HorizontalAlignment="Stretch">
 
                 <StackPanel Grid.Row="0" Spacing="2">
@@ -182,12 +223,19 @@
                                FontSize="12" />
                 </StackPanel>
 
+                <!-- What is standing in the way, if anything. Above the radio
+                     switch on purpose: every problem it reports is a reason the
+                     switch will not work, and finding that out afterwards is
+                     what makes it look like the adapter is broken. -->
+                <muxc:InfoBar Grid.Row="1" x:Name="EnvironmentNotice" IsOpen="False"
+                              IsClosable="True" Severity="Warning" />
+
                 <!-- The radio, and the one control that owns it. -->
-                <Border Grid.Row="1"
+                <Border Grid.Row="2"
                         Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                         BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                         BorderThickness="1" CornerRadius="8" Padding="20,14">
-                    <Grid ColumnDefinitions="Auto,*,*" ColumnSpacing="14">
+                    <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="14">
                         <FontIcon Grid.Column="0" Glyph="&#xE702;" FontSize="20"
                                   VerticalAlignment="Center" />
                         <StackPanel Grid.Column="1" VerticalAlignment="Center">
@@ -209,7 +257,7 @@
                     </Grid>
                 </Border>
 
-                <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+                <ScrollViewer Grid.Row="3" VerticalScrollBarVisibility="Auto">
                     <StackPanel Spacing="16">
 
                         <!-- Remembered devices, above everything, exactly as the
@@ -226,26 +274,26 @@
                                     <DataTemplate x:DataType="local:DeviceRow">
                                         <Grid ColumnDefinitions="Auto,*,Auto,Auto,Auto"
                                               ColumnSpacing="14" Padding="8,10">
-                                            <FontIcon Grid.Column="0" Glyph="{Binding Glyph}"
+                                            <FontIcon Grid.Column="0" Glyph="{x:Bind Glyph}"
                                                       FontSize="20" VerticalAlignment="Center" />
                                             <StackPanel Grid.Column="1" VerticalAlignment="Center"
                                                         Spacing="2">
-                                                <TextBlock Text="{Binding Name}" FontSize="14" />
-                                                <TextBlock Text="{Binding Detail}" FontSize="12"
+                                                <TextBlock Text="{x:Bind Name}" FontSize="14" />
+                                                <TextBlock Text="{x:Bind Detail}" FontSize="12"
                                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                             </StackPanel>
-                                            <Border Grid.Column="2" Visibility="{Binding BadgeVisibility}"
+                                            <Border Grid.Column="2" Visibility="{x:Bind BadgeVisibility}"
                                                     Background="{ThemeResource AccentFillColorDefaultBrush}"
                                                     CornerRadius="4" Padding="8,2"
                                                     VerticalAlignment="Center">
-                                                <TextBlock Text="{Binding Badge}" FontSize="11"
+                                                <TextBlock Text="{x:Bind Badge}" FontSize="11"
                                                            Foreground="{ThemeResource TextOnAccentFillColorPrimaryBrush}" />
                                             </Border>
-                                            <Button Grid.Column="3" Content="{Binding ActionLabel}"
-                                                    Tag="{Binding Address}" Click="ConnectClicked"
+                                            <Button Grid.Column="3" Content="{x:Bind ActionLabel}"
+                                                    Tag="{x:Bind Address}" Click="ConnectClicked"
                                                     MinWidth="92" VerticalAlignment="Center" />
-                                            <Button Grid.Column="4" Content="{Binding UnpairLabel}"
-                                                    Tag="{Binding Address}" Click="ForgetClicked"
+                                            <Button Grid.Column="4" Content="{x:Bind UnpairLabel}"
+                                                    Tag="{x:Bind Address}" Click="ForgetClicked"
                                                     VerticalAlignment="Center" />
                                         </Grid>
                                     </DataTemplate>
@@ -265,20 +313,20 @@
                                     <DataTemplate x:DataType="local:DeviceRow">
                                         <Grid ColumnDefinitions="Auto,*,Auto,Auto" ColumnSpacing="14"
                                               Padding="8,10">
-                                            <FontIcon Grid.Column="0" Glyph="{Binding Glyph}"
+                                            <FontIcon Grid.Column="0" Glyph="{x:Bind Glyph}"
                                                       FontSize="20" VerticalAlignment="Center" />
                                             <StackPanel Grid.Column="1" VerticalAlignment="Center"
                                                         Spacing="2">
-                                                <TextBlock Text="{Binding Name}" FontSize="14" />
-                                                <TextBlock Text="{Binding Detail}" FontSize="12"
+                                                <TextBlock Text="{x:Bind Name}" FontSize="14" />
+                                                <TextBlock Text="{x:Bind Detail}" FontSize="12"
                                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                             </StackPanel>
-                                            <TextBlock Grid.Column="2" Text="{Binding Signal}"
+                                            <TextBlock Grid.Column="2" Text="{x:Bind Signal}"
                                                        FontSize="12" MinWidth="64"
                                                        VerticalAlignment="Center"
                                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                                            <Button Grid.Column="3" Content="{Binding ActionLabel}"
-                                                    Tag="{Binding Address}" Click="ConnectClicked"
+                                            <Button Grid.Column="3" Content="{x:Bind ActionLabel}"
+                                                    Tag="{x:Bind Address}" Click="ConnectClicked"
                                                     MinWidth="92" VerticalAlignment="Center" />
                                         </Grid>
                                     </DataTemplate>
@@ -291,7 +339,7 @@
                 <!-- The log belongs on this page. While the stack is being brought
                      up it is the most useful control here, and hiding it behind a
                      tab means a failure looks like nothing happening at all. -->
-                <Expander Grid.Row="3" HorizontalAlignment="Stretch"
+                <Expander Grid.Row="4" HorizontalAlignment="Stretch"
                           HorizontalContentAlignment="Stretch" IsExpanded="True">
                     <Expander.Header>
                         <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12"
@@ -308,6 +356,15 @@
                                                   OffContent="Debug off"
                                                   Toggled="DebugLogToggled"
                                                   ToolTipService.ToolTip="Detailed HCI, ACL, and ISO packets. Turning debug off clears the detailed log." />
+                                    <ToggleSwitch x:Name="LevelLogSwitch"
+                                                  OnContent="Bands on"
+                                                  OffContent="Bands off"
+                                                  Toggled="LevelLogToggled"
+                                                  ToolTipService.ToolTip="The bass / mid / treble breakdown inside the playing line. Turning it off keeps the line itself - frame count, channel levels, delivered counts and signal - and drops only the three band numbers." />
+                                    <ComboBox x:Name="PlayingRateBox" MinWidth="128"
+                                              VerticalAlignment="Center"
+                                              SelectionChanged="PlayingRateChanged"
+                                              ToolTipService.ToolTip="How often the playing line is printed. The measurement itself keeps running at full speed either way - this only slows down the writing." />
                                     <ToggleSwitch x:Name="FollowLogSwitch"
                                                   OnContent="Follow on"
                                                   OffContent="Follow off"
@@ -332,14 +389,31 @@
                         <Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                                 BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                                 BorderThickness="1" CornerRadius="6" Padding="10,6">
-                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="18">
-                                <TextBlock x:Name="SignalMetric" Text="Signal: -"
-                                           FontSize="12" FontWeight="SemiBold" />
-                                <TextBlock x:Name="LossMetric" Text="Lost packets (60 s): 0"
-                                           FontSize="12" FontWeight="SemiBold" />
-                                <TextBlock x:Name="StabilityMetric" Text="Connection: waiting for data"
-                                           FontSize="12" FontWeight="SemiBold" />
-                            </StackPanel>
+                            <Grid ColumnDefinitions="Auto,*" ColumnSpacing="18">
+
+                                <!-- Battery, drawn rather than written. A number
+                                     alone makes people read it; a shape makes
+                                     them notice it without looking. One cell per
+                                     Battery Service the device publishes, which
+                                     for earbuds is left, right and case. -->
+                                <StackPanel x:Name="BatteryStrip" Grid.Column="0"
+                                            Orientation="Horizontal" Spacing="10"
+                                            VerticalAlignment="Center"
+                                            Visibility="Collapsed" />
+
+                                <StackPanel Grid.Column="1" Orientation="Horizontal"
+                                            HorizontalAlignment="Right" Spacing="18"
+                                            VerticalAlignment="Center">
+                                    <TextBlock x:Name="UptimeMetric" Text="Connected: -"
+                                               FontSize="12" FontWeight="SemiBold" />
+                                    <TextBlock x:Name="SignalMetric" Text="Signal: -"
+                                               FontSize="12" FontWeight="SemiBold" />
+                                    <TextBlock x:Name="LossMetric" Text="Lost packets (60 s): 0"
+                                               FontSize="12" FontWeight="SemiBold" />
+                                    <TextBlock x:Name="StabilityMetric" Text="Connection: waiting for data"
+                                               FontSize="12" FontWeight="SemiBold" />
+                                </StackPanel>
+                            </Grid>
                         </Border>
                     </StackPanel>
                 </Expander>
@@ -410,7 +484,7 @@
                             <TextBlock Text="OpenLEAudio" FontSize="28" FontWeight="SemiBold" />
                             <Border Background="{ThemeResource AccentFillColorDefaultBrush}"
                                     CornerRadius="5" Padding="8,3" VerticalAlignment="Center">
-                                <TextBlock Text="0.9 Beta" FontSize="12"
+                                <TextBlock Text="1.0" FontSize="12"
                                            Foreground="{ThemeResource TextOnAccentFillColorPrimaryBrush}" />
                             </Border>
                         </StackPanel>
@@ -491,6 +565,52 @@
                         </Border>
                     </Grid>
 
+                    <Grid x:Name="AboutTimingGrid" ColumnDefinitions="*,*" RowDefinitions="Auto,Auto"
+                          ColumnSpacing="16" RowSpacing="16">
+                        <Border x:Name="AboutTimingCard"
+                                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                BorderThickness="1" CornerRadius="10" Padding="20">
+                            <StackPanel Spacing="9">
+                                <TextBlock Text="Timing is the whole job" FontSize="19" FontWeight="SemiBold"
+                                           TextWrapping="Wrap" />
+                                <TextBlock Text="An isochronous channel has a slot every 7.5 or 10 ms whether it is filled or not, so a packet that leaves late is not late — it is missing. The send loop runs under the Pro Audio scheduling class and paces itself with a high-resolution waitable timer rather than an ordinary sleep, whose 15.6 ms granularity is wider than the interval it is meant to hit."
+                                           TextWrapping="Wrap" LineHeight="21" />
+                                <TextBlock Text="When Windows has no audio ready in time, silence is sent to hold the cadence instead of skipping the slot, and the gap is counted separately from radio loss — a PC that cannot keep up sounds exactly like a weak signal, and the two need opposite fixes."
+                                           TextWrapping="Wrap" LineHeight="21" />
+                            </StackPanel>
+                        </Border>
+
+                        <Border x:Name="AboutSharingCard" Grid.Column="1"
+                                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                BorderThickness="1" CornerRadius="10" Padding="20">
+                            <StackPanel Spacing="9">
+                                <TextBlock Text="Sharing the headphones, and getting them back" FontSize="19" FontWeight="SemiBold"
+                                           TextWrapping="Wrap" />
+                                <TextBlock Text="Multipoint is a headset-side feature, and no adopted Bluetooth profile lets a host switch it on or off. What is standard is Available Audio Contexts: a headset already playing from a phone withdraws Media from the set it publishes, which is the one vendor-neutral way to tell that somebody else has it."
+                                           TextWrapping="Wrap" LineHeight="21" />
+                                <TextBlock Text="So OpenLEAudio reads that instead of guessing. After a few seconds of silence it releases its endpoints, leaving the connection up, so a phone can take the headphones; when this PC makes a sound again it configures and enables them once more — which is also the specified way to take a multipoint device over."
+                                           TextWrapping="Wrap" LineHeight="21" />
+                            </StackPanel>
+                        </Border>
+                    </Grid>
+
+                    <Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1" CornerRadius="10" Padding="20">
+                        <StackPanel Spacing="9">
+                            <TextBlock Text="What it deliberately does not do" FontSize="19" FontWeight="SemiBold"
+                                       TextWrapping="Wrap" />
+                            <TextBlock Text="It loads no kernel code of its own: the adapter is bound to Microsoft&apos;s own WinUSB driver and Secure Boot stays on. It sends no vendor-specific HCI commands, which is also why brand-specific features — a manufacturer&apos;s own multipoint switch, or its equaliser — are out of reach. Reaching them would mean writing to undocumented characteristics on a device whose firmware update path may live next door."
+                                       TextWrapping="Wrap" LineHeight="21" />
+                            <TextBlock Text="It does not replace the Windows Bluetooth stack. One adapter is handed over; everything else on the machine carries on as before, and Setup gives that adapter back whenever you want it back."
+                                       TextWrapping="Wrap" LineHeight="21" />
+                            <TextBlock Text="LC3 above 48 kHz is not offered, because Bluetooth LE Audio does not define it. A headset advertising 40 kHz is describing its drivers on a cable, not what crosses the air — at 48 kHz the stream already carries the whole audible range."
+                                       TextWrapping="Wrap" LineHeight="21" />
+                        </StackPanel>
+                    </Border>
+
                     <Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                             BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                             BorderThickness="1" CornerRadius="10" Padding="20">
@@ -498,10 +618,16 @@
                             <TextBlock Text="Credits" FontSize="19" FontWeight="SemiBold"
                                        TextWrapping="Wrap" />
                             <TextBlock Text="FajkPes" FontSize="15" FontWeight="SemiBold" />
-                            <TextBlock Text="Claude Code  •  ChatGPT Codex" TextWrapping="Wrap"
+                            <TextBlock Text="Author. Direction, testing against real hardware, and the USB traces that every decision in this stack was measured against rather than guessed at."
+                                       TextWrapping="Wrap" FontSize="12"
                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                            <TextBlock Text="Design, implementation, testing, and debugging of OpenLEAudio."
+                            <TextBlock Text="Claude Code  •  ChatGPT Codex" TextWrapping="Wrap"
+                                       Margin="0,6,0,0" FontWeight="SemiBold" />
+                            <TextBlock Text="Implementation, debugging and documentation, under the author&apos;s direction."
                                        TextWrapping="Wrap"
+                                       FontSize="12" Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                            <TextBlock Text="Built on the lc3-codec, p256, aes and cmac Rust crates, Microsoft&apos;s WinUSB driver, WinUI 3, and VB-Audio Virtual Cable. LC3, BAP, ASCS, PACS and the isochronous channels are Bluetooth SIG specifications; this is an independent implementation of them."
+                                       TextWrapping="Wrap" Margin="0,6,0,0"
                                        FontSize="12" Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
                         </StackPanel>
                     </Border>

@@ -72,6 +72,9 @@ pub enum SessionError {
 
     #[error("isochronni cesta pro audio: {0}")]
     IsoPath(String),
+
+    #[error("protejsek spojeni ukoncil: {} (kod {reason:#04x})", crate::hci::disconnect_reason(*reason))]
+    Disconnected { reason: u8 },
 }
 
 /// How long a CIS may take to come up.
@@ -94,6 +97,14 @@ pub struct LiveAudioConfig {
     pub monitor_gain: f32,
     pub output_gain: f32,
     pub microphone_gain: f32,
+
+    /// Left/right balance, from -1.0 (left only) through 0.0 to +1.0 (right only).
+    ///
+    /// Applied to the captured frame before encoding, so it works the same
+    /// whether the stream carries one channel or two, and takes effect on the
+    /// next frame - a balance control that needs a reconnect cannot be set by
+    /// ear, which is the only way anybody sets one.
+    pub balance: f32,
 }
 
 impl Default for LiveAudioConfig {
@@ -105,6 +116,7 @@ impl Default for LiveAudioConfig {
             monitor_gain: 1.0,
             output_gain: 1.0,
             microphone_gain: 1.0,
+            balance: 0.0,
         }
     }
 }
@@ -116,6 +128,13 @@ pub struct SessionConfig {
     /// USB control-transfer addressing used for HCI commands.
     pub command_style: CommandStyle,
     /// Carry stereo on one CIS when the device allows it.
+    ///
+    /// False by default. One stream for both ears is the tidier arrangement and
+    /// the plan builder will still use it for a device that has only one Sink
+    /// ASE, because there is nowhere else to put the other channel. As a
+    /// preference, though, it selects a path no hardware here has ever run: the
+    /// reference headset publishes one channel per stream, so "prefer single"
+    /// would only ever take effect on a device nobody has tested.
     pub prefer_single_cis: bool,
     /// Capture device name to look for; None picks the virtual cable.
     pub audio_device: Option<String>,
@@ -142,6 +161,27 @@ pub struct SessionConfig {
     /// What to do when the headphones walk out of range.
     pub reconnect: ReconnectPolicy,
 
+    /// How long silence lasts before the headphones are handed back.
+    ///
+    /// Holding a configured stream open through silence keeps the headphones
+    /// ours, and a phone that starts playing cannot have them: from the
+    /// headset's point of view this host is still using it. Releasing the
+    /// endpoints while leaving the connection up is what multipoint is, done
+    /// from the correct side - and taking them back is the ordinary Enable we
+    /// already send, so nothing vendor-specific is involved either way.
+    ///
+    /// `None` never yields, which is right for someone who wants the headphones
+    /// pinned to this machine.
+    pub multipoint_yield: Option<Duration>,
+
+    /// How much the stack interrogates the controller while audio plays.
+    ///
+    /// Every question is an HCI command over USB and a moment of the
+    /// controller's attention, and the answers only ever go to a display.
+    /// Someone running on battery who is not debugging anything should be able
+    /// to say so and get the airtime back.
+    pub metrics: MetricsLevel,
+
     /// Sends the left channel to the second stream and vice versa.
     ///
     /// For devices whose ASEs are wired to a fixed earpiece regardless of the
@@ -152,6 +192,40 @@ pub struct SessionConfig {
     /// plays and judged by ear on the spot.
     pub swap_channels: Arc<AtomicBool>,
     pub scan_duration: Duration,
+
+    /// How long the link may go unheard before the controller declares it lost.
+    ///
+    /// This is the number that decides what happens when someone walks out of
+    /// range: shorter than the trip, and the connection is over before they are
+    /// back; longer, and the audio stops and then resumes. It costs nothing
+    /// while the headphones are in range.
+    pub link_timeout: Duration,
+
+    /// Raised from outside to ask the headphones for their battery level now.
+    ///
+    /// The audio loop owns the ACL for as long as it runs, so nothing else can
+    /// put a question on the link while music is playing. This is how a click on
+    /// the battery indicator reaches the radio instead of being ignored until
+    /// the next disconnection.
+    pub battery_refresh: Arc<AtomicBool>,
+
+    /// How often to ask unprompted, or `None` to rely on notifications alone.
+    ///
+    /// Notifications are free and arrive when the level actually moves, so this
+    /// is off by default. Some headsets subscribe successfully and then never
+    /// notify, which looks like a battery stuck at whatever it was on connect,
+    /// and for those a slow poll is the only way to see the number move.
+    pub battery_poll: Option<Duration>,
+
+    /// How many connection events the headphones may skip once audio is running.
+    ///
+    /// Zero leaves the link exactly as it was negotiated. Anything higher is
+    /// pure saving on the headphones' side: the ACL carries no audio, so the
+    /// events being skipped are ones where neither side had anything to say.
+    /// The cost is that a volume press or a battery change is noticed up to that
+    /// many intervals later, which for a handful of events is tens of
+    /// milliseconds and inaudible.
+    pub idle_link_latency: u16,
 }
 
 impl Default for SessionConfig {
@@ -159,7 +233,7 @@ impl Default for SessionConfig {
         Self {
             preset: Preset::WindowsDefault,
             command_style: CommandStyle::ClassDevice,
-            prefer_single_cis: true,
+            prefer_single_cis: false,
             audio_device: None,
             microphone_target: None,
             microphone_gain: 1.0,
@@ -171,7 +245,16 @@ impl Default for SessionConfig {
             scan_duration: Duration::from_secs(10),
             idle_timeout: Some(Duration::from_secs(300)),
             reconnect: ReconnectPolicy::default(),
+            // None. See the setting for why: handing the headphones back costs a
+            // whole stream rebuild, and there is no way to know from here
+            // whether anything wants them.
+            multipoint_yield: None,
+            metrics: MetricsLevel::default(),
             swap_channels: Arc::new(AtomicBool::new(false)),
+            link_timeout: Duration::from_secs(10),
+            battery_refresh: Arc::new(AtomicBool::new(false)),
+            battery_poll: None,
+            idle_link_latency: 0,
         }
     }
 }
@@ -192,6 +275,11 @@ pub enum Progress {
         /// the audio never leaves the adapter" and a genuine radio problem.
         iso_sent: u64,
         iso_failed: u64,
+        /// Intervals where Windows had produced no audio in time and silence was
+        /// sent to keep the stream in step. This is the PC failing to keep up,
+        /// and it sounds identical to a radio fault - so it is counted
+        /// separately rather than left to be blamed on the link.
+        underruns: u64,
         /// Level of each captured channel, in dBFS. Two identical numbers over
         /// real music mean the source is mono and nothing downstream can undo it.
         left_db: f32,
@@ -206,19 +294,67 @@ pub enum Progress {
         rssi: Option<i8>,
         /// Packets the controller confirms it has sent, per isochronous channel.
         delivered: Vec<u64>,
+        /// What the radio itself says about each isochronous channel.
+        ///
+        /// Empty until the controller has answered once. A controller that does
+        /// not implement LE Read ISO Link Quality leaves this empty forever,
+        /// which is the honest answer - better than a zero that reads as
+        /// "nothing was lost".
+        quality: Vec<crate::hci::IsoLinkQuality>,
     },
     /// The audio source the stream is reading from, and its exact format.
     CaptureReady { device: String, format: String },
+    /// How much charge each battery the device publishes has left.
+    ///
+    /// One entry per Battery Service instance, in the order the device lists
+    /// them - which for earbuds is conventionally left, right, then case.
+    Battery { levels: Vec<u8> },
+    /// A battery level was asked for over the air, and why.
+    ///
+    /// Worth reporting because it is the one question this stack asks
+    /// unprompted. Someone watching their headphones' runtime is entitled to see
+    /// every packet spent on a display.
+    BatteryAsked { reason: &'static str },
     /// Nothing has been playing, so the stack stopped transmitting. The
     /// connection and both isochronous streams stay up.
     Idle { after: Duration },
     /// Sound came back and transmission resumed.
     Resumed,
+    /// Silence has lasted long enough that the headphones are being handed
+    /// back, so another device can take them. The connection stays up.
+    Yielded { after: Duration },
     /// The ACL link ended at the controller, with the Bluetooth reason code.
     /// Kept separate from a generic stop so callers can safely decide whether
     /// this was a lost link worth reconnecting or a local/user-requested stop.
     Disconnected { reason: u8 },
     Stopped { reason: String },
+}
+
+/// How closely the stack watches its own radio while audio is playing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MetricsLevel {
+    /// Ask nothing. The stream still reports levels and frame counts, which
+    /// cost nothing extra - they are measured from audio already in hand.
+    Off,
+    /// Signal strength only, once a second. One command, and it is the number
+    /// that explains most dropouts.
+    #[default]
+    Signal,
+    /// Signal strength and per-channel packet loss from the controller. The
+    /// honest answer to "how much audio did the headphones miss", at the cost
+    /// of one more command per channel per second.
+    Full,
+}
+
+impl MetricsLevel {
+    pub fn from_setting(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "signal" => Some(Self::Signal),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
 }
 
 /// What the stack does when a connection drops on its own.
@@ -244,8 +380,8 @@ impl Default for ReconnectPolicy {
     fn default() -> Self {
         Self {
             enabled: true,
-            interval: Duration::from_secs(5),
-            window: Some(Duration::from_secs(120)),
+            interval: Duration::from_secs(3),
+            window: Some(Duration::from_secs(900)),
         }
     }
 }
@@ -302,6 +438,26 @@ impl ReconnectPolicy {
 /// Not a comparison against zero: a real silent stream from Windows carries
 /// dither and the odd stray least significant bit, and treating that as audio
 /// means never going idle at all.
+/// Tilts an interleaved stereo frame towards one ear.
+///
+/// Only ever attenuates. Raising the near side instead would clip material that
+/// is already near full scale, and a balance control that distorts at one end of
+/// its travel is worse than no balance control.
+pub fn apply_balance(samples: &mut [i16], balance: f32) {
+    let balance = balance.clamp(-1.0, 1.0);
+    if balance.abs() < 0.001 {
+        return;
+    }
+
+    let left = if balance > 0.0 { 1.0 - balance } else { 1.0 };
+    let right = if balance < 0.0 { 1.0 + balance } else { 1.0 };
+
+    for pair in samples.chunks_exact_mut(2) {
+        pair[0] = (pair[0] as f32 * left).round().clamp(-32768.0, 32767.0) as i16;
+        pair[1] = (pair[1] as f32 * right).round().clamp(-32768.0, 32767.0) as i16;
+    }
+}
+
 fn is_silent(samples: &[i16]) -> bool {
     const FLOOR: i16 = 16; // about -66 dBFS
     samples.iter().all(|s| s.saturating_abs() <= FLOOR)
@@ -455,6 +611,8 @@ pub struct Session {
     controller: Option<Controller>,
     write_policy: WritePolicy,
     volume: Option<VolumeBridge>,
+    /// Each Battery Service the peer publishes, and the last level seen.
+    batteries: Vec<(crate::link::BatteryHandles, Option<u8>)>,
 }
 
 impl Session {
@@ -464,6 +622,7 @@ impl Session {
             controller: None,
             write_policy: WritePolicy::default(),
             volume: None,
+            batteries: Vec::new(),
         }
     }
 
@@ -552,12 +711,38 @@ impl Session {
     pub fn connect<F: FnMut(Progress)>(
         &mut self,
         device: &DiscoveredDevice,
+        report: F,
+    ) -> Result<u16> {
+        self.connect_within(device, Duration::from_secs(15), report)
+    }
+
+    /// The same, with an explicit limit on how long to keep the radio trying.
+    ///
+    /// A connection attempt is not a request that fails and returns: the
+    /// controller keeps listening for the peer to advertise until it is told to
+    /// stop. That makes the timeout the interesting parameter rather than an
+    /// implementation detail.
+    ///
+    /// Someone who has just pressed Connect deserves a long window - the
+    /// headphones are in their hands. Automatic reconnect wants a short one and
+    /// many of them: the controller then spends almost every moment listening,
+    /// so the connection completes the instant the headphones come back, and
+    /// the gap between attempts is where the retry interval actually lives.
+    pub fn connect_within<F: FnMut(Progress)>(
+        &mut self,
+        device: &DiscoveredDevice,
+        timeout: Duration,
         mut report: F,
     ) -> Result<u16> {
+        let link_timeout = self.config.link_timeout;
         let controller = self.controller.as_mut().ok_or(SessionError::NoDeviceFound)?;
 
+        // Applied per attempt, so changing it in the settings takes effect on
+        // the next reconnect rather than on the next launch.
+        controller.set_supervision_timeout(link_timeout);
+
         let handle = controller
-            .connect(device.address, device.address_type, Duration::from_secs(15))?
+            .connect(device.address, device.address_type, timeout)?
             .ok_or(SessionError::ConnectFailed)?;
 
         report(Progress::Connected { handle });
@@ -748,6 +933,35 @@ impl Session {
         Ok(Some(summary))
     }
 
+    /// Reads the headphones' battery levels and asks to be told when they change.
+    ///
+    /// Returns what was read, which is empty when the device publishes no
+    /// battery information - a normal state, not a failure. Subscribing is best
+    /// effort for the same reason: a device that reports a level but refuses
+    /// notifications still gives a useful number, it just gives it once.
+    pub fn attach_batteries(&mut self, link: &mut Link) -> Result<Vec<u8>> {
+        self.batteries.clear();
+
+        for handles in link.discover_batteries()? {
+            let level = link.read_battery_level(handles.level).ok().flatten();
+
+            if handles.notifies {
+                self.write_policy.allow_subscription(handles.level_cccd);
+                // Best effort: the level already read stays valid either way.
+                let _ = link.subscribe(handles.level_cccd);
+            }
+
+            self.batteries.push((handles, level));
+        }
+
+        Ok(self.battery_levels())
+    }
+
+    /// The levels last seen, in the order the device publishes them.
+    pub fn battery_levels(&self) -> Vec<u8> {
+        self.batteries.iter().filter_map(|(_, level)| *level).collect()
+    }
+
     /// Sets the headphones' volume from a Windows-style 0.0-1.0 level.
     pub fn set_volume(&mut self, link: &mut Link, level: f32) -> Result<()> {
         let Some(bridge) = self.volume.as_mut() else {
@@ -838,10 +1052,67 @@ impl Session {
         // that is not an error worth reporting.
         let _ = controller.command(&hci::le_remove_cig(plan.cig_id));
 
-        let cig_command = plan.cig_command();
-        safety::check_hci_command(&cig_command)?;
+        // The group is asked for as the plan describes it, and then - only if
+        // the controller refuses - with less asked of the radio.
+        //
+        // Retransmissions and transport latency are the two numbers that decide
+        // whether a group can be scheduled at all. At 2M PHY the values taken
+        // from the trace fit comfortably; at 1M every packet takes twice as long
+        // on air, so the same two channels at the same interval no longer fit
+        // inside one ISO interval and the controller answers "invalid HCI
+        // parameters". Nothing downstream can tell that apart from the device
+        // refusing the stream, which is why switching the radio to 1M looked
+        // like the headphones no longer connecting.
+        //
+        // Reducing here rather than in the plan is deliberate: the plan is what
+        // the user asked for and what the settings page shows. This is the
+        // controller's own limit, discovered by asking, and it is said out loud.
+        let (response, cig_command) = {
+            let mut relaxed = plan.clone();
+            let mut attempt = 0;
+            loop {
+                let command = relaxed.cig_command();
+                safety::check_hci_command(&command)?;
 
-        let response = controller.command(&cig_command)?;
+                match controller.command(&command) {
+                    Ok(response) => break (response, command),
+                    Err(error) => {
+                        attempt += 1;
+                        let can_relax = relaxed.qos.retransmission_number > 2
+                            || relaxed.qos.max_transport_latency_ms < 95;
+                        if attempt > 4 || !can_relax {
+                            return Err(SessionError::IsoPath(format!(
+                                "the controller will not create the isochronous group: {error}.                                  Asked for {} channels of {} bytes every {} us on the {} PHY,                                  {} retransmissions, {} ms transport latency",
+                                relaxed.ase_ids.len().max(1),
+                                relaxed.codec.octets_per_frame,
+                                relaxed.qos.sdu_interval_us,
+                                if relaxed.qos.phy == 0x01 { "1M" } else { "2M" },
+                                relaxed.qos.retransmission_number,
+                                relaxed.qos.max_transport_latency_ms,
+                            )));
+                        }
+
+                        // Retransmissions first: they cost air time directly and
+                        // the difference between 13 and 4 is inaudible on a link
+                        // that is working. Transport latency only afterwards,
+                        // because raising it is what the user notices.
+                        if relaxed.qos.retransmission_number > 2 {
+                            relaxed.qos.retransmission_number =
+                                (relaxed.qos.retransmission_number / 2).max(2);
+                        } else {
+                            relaxed.qos.max_transport_latency_ms =
+                                (relaxed.qos.max_transport_latency_ms + 20).min(95);
+                        }
+
+                        crate::trace::note(&format!(
+                            "CIG refused ({error}); asking again with {} retransmissions                              and {} ms transport latency",
+                            relaxed.qos.retransmission_number, relaxed.qos.max_transport_latency_ms
+                        ));
+                    }
+                }
+            }
+        };
+        let _ = &cig_command;
 
         // Return parameters: status, CIG id, CIS count, then one handle each.
         let mut cis_handles = Vec::new();
@@ -888,16 +1159,65 @@ impl Session {
         let create = hci::le_create_cis(&pairs);
         safety::check_hci_command(&create)?;
 
-        controller.command(&create).map_err(|e| {
-            SessionError::IsoPath(format!(
-                "{e}; offered channels {cis_handles:?}, ACL handle {acl_handle:#06x}"
-            ))
-        })?;
+        if let Err(e) = controller.command(&create) {
+            // "Unknown connection identifier" names neither handle it disliked,
+            // and the two possibilities need opposite fixes: a dead ACL means
+            // the link went away and the whole connection has to be rebuilt,
+            // while dead CIS handles mean the group we just created is not the
+            // group the controller thinks it has.
+            //
+            // Read RSSI is the cheapest question that distinguishes them. It
+            // takes an ACL handle and nothing else, so if it answers, the ACL is
+            // alive and the CIS handles are the problem.
+            let acl_alive = controller
+                .command(&hci::read_rssi(acl_handle))
+                .is_ok();
+
+            let blame = if acl_alive {
+                format!(
+                    "the ACL link {acl_handle:#06x} is still up, so the controller is \
+                     refusing the isochronous handles {cis_handles:?} it handed out itself"
+                )
+            } else {
+                format!("the ACL link {acl_handle:#06x} is gone")
+            };
+
+            return Err(SessionError::IsoPath(format!(
+                "{e}; {blame}. CIG {:#04x} answered {} bytes: {}",
+                plan.cig_id,
+                response.len(),
+                response
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )));
+        }
 
         for _ in 0..cis_handles.len() {
+            // The peer ending the ACL link counts as an answer too, and it is
+            // the one that used to be missed: waiting eight seconds for a
+            // channel that will never come is exactly when a headset gives up
+            // on the connection, and carrying on afterwards means building the
+            // next attempt on a handle the controller has already forgotten.
+            let mut acl_gone = None;
             let event = controller.wait_for_event(CIS_ESTABLISH_TIMEOUT, |e| {
+                if let Some((closed, reason)) = hci::parse_disconnection_complete(e) {
+                    if closed == acl_handle {
+                        acl_gone = Some(reason);
+                        return true;
+                    }
+                }
                 hci::parse_cis_established(e).is_some()
             })?;
+
+            if let Some(reason) = acl_gone {
+                return Err(SessionError::IsoPath(format!(
+                    "the headphones ended the connection while the channels were \
+                     being established: {} (code {reason:#04x})",
+                    crate::hci::disconnect_reason(reason)
+                )));
+            }
 
             match event.and_then(|e| hci::parse_cis_established(&e)) {
                 Some((0x00, handle)) => outcome.established.push(handle),
@@ -934,6 +1254,39 @@ impl Session {
         }
 
         let established = outcome.established.clone();
+
+        // Relaxed only now, with the group built and every ASE configured. Doing
+        // it earlier would slow down the very GATT exchange that sets the stream
+        // up, which is the opposite of what anyone wants.
+        if self.config.idle_link_latency > 0 {
+            let latency = self.config.idle_link_latency;
+            let interval = 0x0018u16; // 30 ms
+            let timeout_units = (self.config.link_timeout.as_millis() / 10) as u16;
+
+            // The link must not be able to time out while the headphones are
+            // legitimately asleep. Six times the longest gap they may take is
+            // the specification's own margin, and the configured timeout is used
+            // whenever it is already longer than that.
+            let needed = interval
+                .saturating_mul(latency.saturating_add(1))
+                .saturating_mul(5)
+                / 4;
+            let timeout = hci::clamp_supervision(timeout_units.max(needed));
+
+            let update = hci::le_connection_update(acl_handle, interval, interval, latency, timeout);
+            match controller.command(&update) {
+                Ok(_) => crate::trace::note(&format!(
+                    "link relaxed: the headphones may skip up to {latency} connection events,                      timeout {} ms",
+                    timeout as u32 * 10
+                )),
+                // Not fatal, and not worth failing a working stream over. The
+                // link simply stays as it was, which is what it did before this
+                // existed.
+                Err(error) => crate::trace::note(&format!(
+                    "the controller refused to relax the link ({error}); leaving it as negotiated"
+                )),
+            }
+        }
 
         // Transparent data path: the controller forwards our LC3 bytes untouched.
         // Only for channels that actually came up.
@@ -998,6 +1351,12 @@ impl Session {
         } else {
             AudioEncoder::new(plan.codec)
         };
+
+        // One outstanding battery read at a time, matched to its answer by hand:
+        // an ATT read response carries only the value, never the handle it
+        // belongs to.
+        let mut pending_battery: Option<u16> = None;
+        let mut battery_asked_at = Instant::now();
 
         let microphone_handle = plan
             .microphone
@@ -1107,15 +1466,49 @@ impl Session {
         }
 
         let frame_interval = Duration::from_micros(plan.qos.sdu_interval_us as u64);
+
+        // Every wait in this loop goes through it. An ordinary sleep rounds up
+        // to the system tick and turns a 7.5 ms cadence into an irregular one.
+        let clock = crate::audio::PreciseTimer::new();
+
+        // Let the capture build a small head start before the cadence begins.
+        //
+        // Without this the first frames are requested before Windows has
+        // produced any, the loop takes the underrun path immediately, and the
+        // stream starts out of step with its own deadline - which it then
+        // spends the next few seconds recovering from, audibly.
+        let prime_deadline = Instant::now() + Duration::from_millis(120);
+        while Instant::now() < prime_deadline
+            && capture.backlog() < encoder.samples_per_frame() * 4
+        {
+            clock.sleep(Duration::from_millis(5));
+            let _ = capture.pump();
+        }
+
         let mut next_deadline = Instant::now();
         let mut frames_sent: u64 = 0;
         let mut iso_sent: u64 = 0;
         let mut delivered = vec![0u64; cis_handles.len()];
         let mut iso_failed: u64 = 0;
+        // Intervals where Windows had produced no audio in time. A handful at
+        // startup is normal; a steady stream of them is the PC failing to keep
+        // up, which sounds exactly like a radio problem and is not one.
+        let mut underruns: u64 = 0;
         let mut last_report = Instant::now();
-        let mut last_rssi_request = Instant::now() - Duration::from_secs(2);
-        let mut rssi_request_pending = false;
+
+        // One diagnostic question at a time, asked in turn.
+        //
+        // The controller accepts a limited number of outstanding commands - one,
+        // on the adapters this runs on - so two independent pollers each with
+        // their own "pending" flag can and do overlap, and the second command is
+        // simply dropped. Cycling through them from a single slot keeps every
+        // answer, and asking every 400 ms still refreshes each channel about
+        // once a second.
+        let mut last_diagnostic = Instant::now() - Duration::from_secs(2);
+        let mut diagnostic_pending = false;
+        let mut diagnostic_turn: usize = 0;
         let mut latest_rssi: Option<i8> = None;
+        let mut quality: Vec<crate::hci::IsoLinkQuality> = Vec::new();
 
         loop {
             if should_stop() {
@@ -1138,12 +1531,22 @@ impl Session {
             while let Some(event) = pump.try_recv_event() {
                 if let Some((opcode, params)) = event.command_complete() {
                     if opcode == hci::op::READ_RSSI {
-                        rssi_request_pending = false;
+                        diagnostic_pending = false;
                         // status(1), connection_handle(2), rssi(1)
                         if params.len() >= 4 && params[0] == 0 {
                             let response_handle = u16::from_le_bytes([params[1], params[2]]);
                             if Some(response_handle) == acl_handle {
                                 latest_rssi = Some(params[3] as i8);
+                            }
+                        }
+                    }
+
+                    if opcode == hci::op::LE_READ_ISO_LINK_QUALITY {
+                        diagnostic_pending = false;
+                        if let Some(reading) = hci::parse_iso_link_quality(params) {
+                            match quality.iter_mut().find(|q| q.handle == reading.handle) {
+                                Some(existing) => *existing = reading,
+                                None => quality.push(reading),
                             }
                         }
                     }
@@ -1169,16 +1572,46 @@ impl Session {
                 return Ok(());
             }
 
-            if let Some(handle) = acl_handle {
-                if !rssi_request_pending && last_rssi_request.elapsed() >= Duration::from_secs(1) {
-                    let command = hci::read_rssi(handle);
+            // Nothing is being transmitted while idle, so there is nothing to
+            // measure and nobody watching a number that cannot change. Every
+            // question skipped here is a USB transfer and a moment of the
+            // controller's attention saved, for as long as the silence lasts -
+            // which for headphones worn all day is most of the day.
+            let metrics = if idle { MetricsLevel::Off } else { self.config.metrics };
+            let diagnostic_slots = match metrics {
+                MetricsLevel::Off => 0,
+                MetricsLevel::Signal => 1,
+                MetricsLevel::Full => 1 + cis_handles.len(),
+            };
+
+            if diagnostic_slots > 0
+                && !diagnostic_pending
+                && last_diagnostic.elapsed() >= Duration::from_millis(400)
+            {
+                // Signal strength, then each isochronous channel, then round
+                // again. Every question is about the same connection, so there
+                // is nothing to gain from asking any of them more often than the
+                // others.
+                let slot = diagnostic_turn % diagnostic_slots;
+                diagnostic_turn = diagnostic_turn.wrapping_add(1);
+
+                let command = if slot == 0 {
+                    acl_handle.map(hci::read_rssi)
+                } else {
+                    cis_handles
+                        .get(slot - 1)
+                        .copied()
+                        .map(hci::le_read_iso_link_quality)
+                };
+
+                if let Some(command) = command {
                     if safety::check_hci_command(&command).is_ok()
                         && transport.send_command(&command).is_ok()
                     {
-                        rssi_request_pending = true;
+                        diagnostic_pending = true;
                     }
-                    last_rssi_request = Instant::now();
                 }
+                last_diagnostic = Instant::now();
             }
 
             let live = live_audio
@@ -1210,6 +1643,44 @@ impl Session {
                         Err(error) => crate::trace::note(&format!(
                             "monitoring could not be enabled ({error}); playback continues"
                         )),
+                    }
+                }
+            }
+
+            // Asked for at most once per pass, and only when something actually
+            // wants an answer. A read costs one small packet each way on a link
+            // that is already carrying audio, so the honest cost is tiny - but
+            // it is not nothing, which is why nothing here happens on its own
+            // unless the user turned the poll on.
+            if let Some(handle) = acl_handle {
+                let asked_for = self
+                    .config
+                    .battery_refresh
+                    .swap(false, Ordering::Relaxed);
+                let due = self
+                    .config
+                    .battery_poll
+                    .is_some_and(|every| battery_asked_at.elapsed() >= every);
+
+                if pending_battery.is_none() && (asked_for || due) {
+                    if let Some((handles, _)) = self.batteries.first() {
+                        let pdu = crate::att::read_request(handles.level);
+                        let packets = crate::att::build_acl_packets(
+                            handle,
+                            crate::att::cid::ATT,
+                            &pdu,
+                            27,
+                        );
+                        let sent = packets
+                            .iter()
+                            .all(|packet| transport.send_acl(packet).is_ok());
+                        if sent {
+                            pending_battery = Some(handles.level);
+                            battery_asked_at = Instant::now();
+                            report(Progress::BatteryAsked {
+                                reason: if asked_for { "asked for" } else { "scheduled" },
+                            });
+                        }
                     }
                 }
             }
@@ -1267,13 +1738,73 @@ impl Session {
                             }
                         }
                     }
+
+                    // A read we asked for comes back without saying which
+                    // handle it answers, so it is matched against the request
+                    // still outstanding. Only one is ever in flight.
+                    if let Some(handle) = pending_battery {
+                        if frame.cid == crate::att::cid::ATT
+                            && frame.payload.first() == Some(&crate::att::att_op::READ_RESPONSE)
+                        {
+                            pending_battery = None;
+                            let fresh = crate::link::parse_battery_level(&frame.payload[1..]);
+                            let mut moved = false;
+                            for (handles, level) in self.batteries.iter_mut() {
+                                if handles.level == handle && fresh.is_some() && fresh != *level {
+                                    *level = fresh;
+                                    moved = true;
+                                }
+                            }
+                            if moved {
+                                let levels = self.battery_levels();
+                                report(Progress::Battery { levels });
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Battery levels arrive the same way, and only while audio
+                    // is running - this loop owns the ACL for its whole
+                    // duration, so a notification not read here is a
+                    // notification lost.
+                    if let Some((notified, value)) = notification(&frame) {
+                        let mut moved = false;
+                        for (handles, level) in self.batteries.iter_mut() {
+                            if handles.level != notified {
+                                continue;
+                            }
+                            let fresh = crate::link::parse_battery_level(value);
+                            if fresh.is_some() && fresh != *level {
+                                *level = fresh;
+                                moved = true;
+                            }
+                        }
+                        if moved {
+                            let levels = self.battery_levels();
+                            report(Progress::Battery { levels });
+                        }
+                    }
                 }
             }
 
-            let Some(mut samples) = capture.next_frame(encoder.samples_per_frame())? else {
-                // Nothing captured yet: wait a fraction of an interval rather than spin.
-                std::thread::sleep(frame_interval / 4);
-                continue;
+            // An underrun is not a reason to stop sending. The isochronous
+            // channel has a slot every interval whether we fill it or not, and a
+            // skipped slot is a hole in the audio the headphones cannot conceal.
+            // Substituting silence keeps the stream in step, so the capture has
+            // the next whole interval to catch up in rather than the loop
+            // sliding out of phase and staying there.
+            //
+            // The old code slept a quarter interval and went round again, which
+            // abandoned the deadline entirely: after an underrun the next real
+            // frame went out immediately instead of on time, and the one after
+            // that was late. That is most of the audio "cutting out" during
+            // ordinary use.
+            let mut samples = match capture.next_frame(encoder.samples_per_frame())? {
+                Some(samples) => samples,
+                None => {
+                    underruns += 1;
+                    vec![0i16; encoder.samples_per_frame() * 2]
+                }
             };
 
             if live.monitor_enabled && plan.playback_enabled {
@@ -1319,7 +1850,7 @@ impl Session {
             }
 
             if !plan.playback_enabled {
-                std::thread::sleep(frame_interval / 4);
+                clock.sleep(frame_interval / 4);
                 continue;
             }
 
@@ -1332,6 +1863,7 @@ impl Session {
                 return Err(violation.into());
             }
             limiter.apply(&mut samples);
+            apply_balance(&mut samples, live.balance);
             soft_start.apply(&mut samples);
 
             // One packet per CIS: left to the first, right to the second. A
@@ -1352,7 +1884,19 @@ impl Session {
 
             // Track how long the stream has had nothing in it.
             if is_silent(&samples) {
-                silent_since.get_or_insert_with(Instant::now);
+                let since = *silent_since.get_or_insert_with(Instant::now);
+
+                // Handing the headphones back has to happen out here, not in
+                // the loop: releasing the endpoints means the stream this
+                // function is driving no longer exists. The caller tears the
+                // group down and waits for sound, which is also the only place
+                // that can build it all again afterwards.
+                if let Some(yield_after) = self.config.multipoint_yield {
+                    if since.elapsed() >= yield_after {
+                        report(Progress::Yielded { after: yield_after });
+                        return Ok(());
+                    }
+                }
             } else {
                 silent_since = None;
                 if idle {
@@ -1375,13 +1919,51 @@ impl Session {
             }
 
             if idle {
-                next_deadline += frame_interval;
-                let now = Instant::now();
-                if next_deadline > now {
-                    std::thread::sleep(next_deadline - now);
-                } else {
-                    next_deadline = now;
+                // Nothing is being sent, so there is no cadence to hold. Waking
+                // every 7.5 ms to look at silence is a hundred and thirty
+                // needless wake-ups a second, and while idle every one of them
+                // is spent confirming that nothing happened.
+                //
+                // Waiting longer means more than one frame accumulates between
+                // looks, so every frame that arrived has to be examined - not
+                // just the first. Taking one and sleeping again would let the
+                // capture buffer fill until Windows declared an overrun, and the
+                // audio would come back with a glitch and a backlog. Examining
+                // them all and discarding the silence keeps the buffer empty and
+                // still notices sound in the first frame that contains any.
+                const IDLE_POLL: Duration = Duration::from_millis(40);
+
+                let mut woke = false;
+                loop {
+                    let Some(next) = capture.next_frame(encoder.samples_per_frame())? else {
+                        break;
+                    };
+                    if !is_silent(&next) {
+                        woke = true;
+                        break;
+                    }
                 }
+
+                if woke {
+                    // Leave idle here rather than waiting for the next pass, so
+                    // the sound that woke us is the sound that gets sent.
+                    idle = false;
+                    silent_since = None;
+                    soft_start = crate::safety::SoftStart::over(60, plan.qos.sdu_interval_us);
+                    crate::trace::note("zvuk se vratil, pokracujeme");
+                    report(Progress::Resumed);
+                    next_deadline = Instant::now();
+                    continue;
+                }
+
+                // The deadline is carried forward rather than reset, so the
+                // first real frame after the silence lands on the grid instead
+                // of wherever the coarse wait happened to end.
+                let now = Instant::now();
+                while next_deadline <= now {
+                    next_deadline += frame_interval;
+                }
+                clock.sleep(IDLE_POLL.min(next_deadline.saturating_duration_since(now)));
                 continue;
             }
 
@@ -1419,6 +2001,7 @@ impl Session {
                     backlog: capture.backlog(),
                     iso_sent,
                     iso_failed,
+                    underruns,
                     left_db,
                     right_db,
                     bass_db,
@@ -1426,6 +2009,7 @@ impl Session {
                     treble_db,
                     rssi: latest_rssi,
                     delivered: delivered.clone(),
+                    quality: quality.clone(),
                 });
                 last_report = Instant::now();
 
@@ -1440,11 +2024,127 @@ impl Session {
             next_deadline += frame_interval;
             let now = Instant::now();
             if next_deadline > now {
-                std::thread::sleep(next_deadline - now);
-            } else {
-                // Fell behind: resynchronise instead of accumulating debt.
+                clock.sleep(next_deadline - now);
+            } else if now.duration_since(next_deadline) > frame_interval * 4 {
+                // Far enough behind that catching up frame by frame would mean a
+                // burst of packets the radio cannot deliver anyway.
                 next_deadline = now;
             }
+            // Only slightly late: leave the deadline where it is, so the next
+            // frame goes out early by the same amount and the cadence recovers
+            // instead of drifting. Resetting on every small overshoot is how the
+            // interval quietly becomes "however long a frame took".
+        }
+    }
+
+    /// Blocks until the capture device has something audible in it.
+    ///
+    /// Used while the headphones belong to somebody else. Nothing is configured
+    /// on them and nothing is transmitted, so this is as close to costing
+    /// nothing as the stack gets: one Windows capture endpoint, examined five
+    /// times a second.
+    ///
+    /// Returns false if the caller asked to stop first.
+    pub fn wait_for_sound<S>(
+        &mut self,
+        acl_handle: u16,
+        sample_rate: u32,
+        frame_us: u32,
+        mut should_stop: S,
+    ) -> Result<bool>
+    where
+        S: FnMut() -> bool,
+    {
+        let device = crate::audio::find_cable_device(self.config.audio_device.as_deref())?;
+        let mut capture = AudioCapture::open(&device.id, sample_rate)?;
+
+        // A frame's worth at a time, which is the same unit the encoder uses -
+        // so "audible" means exactly what it means during playback and the two
+        // cannot disagree about where silence ends.
+        let frame = (sample_rate as usize * frame_us as usize) / 1_000_000;
+        let clock = crate::audio::PreciseTimer::new();
+
+        // The connection has to be looked after while we sit here, and this is
+        // the only thing running. The peer sends a connection parameter update
+        // unprompted - especially now, having just had every endpoint released,
+        // because that is exactly when it wants to relax the link - and it
+        // starts a timer waiting for the answer. Nothing answered it: this
+        // function read the sound card and slept, and the link was gone by the
+        // time anybody tried to speak on it again.
+        //
+        // The failure landed several steps later, on the first write of the
+        // rebuilt stream, and read as "codec configuration failed" - so the
+        // handing-back looked like it broke the stream setup rather than the
+        // connection underneath it.
+        let transport = {
+            let controller = self.controller.as_ref().ok_or(SessionError::NoDeviceFound)?;
+            controller.transport().clone()
+        };
+        let pump = {
+            let controller = self.controller.as_ref().ok_or(SessionError::NoDeviceFound)?;
+            controller.pump()
+        };
+        let mut acl = crate::att::AclReassembler::new();
+
+        loop {
+            if should_stop() {
+                return Ok(false);
+            }
+
+            // Anything the peer says, including the notice that it has given up
+            // on us. Waiting for sound that will never be delivered to a link
+            // that no longer exists is silence nobody can explain.
+            while let Ok(event) = pump.recv_event(Duration::ZERO) {
+                if let Some((closed, reason)) = crate::hci::parse_disconnection_complete(&event) {
+                    if closed == acl_handle {
+                        return Err(SessionError::Disconnected { reason });
+                    }
+                }
+            }
+
+            while let Ok(raw) = pump.recv_acl(Duration::ZERO) {
+                let Ok(Some(frame)) = acl.push(&raw) else { continue };
+                if crate::Link::answer_signalling(&transport, acl_handle, 27, &frame).is_some() {
+                    continue;
+                }
+
+                // Volume and battery keep arriving while we wait. Absorbing them
+                // costs nothing and stops the displays freezing at whatever they
+                // held when the music stopped.
+                if let Some((notified, value)) = notification(&frame) {
+                    if let Some(bridge) = self.volume.as_mut() {
+                        if notified == bridge.handles.state {
+                            bridge.absorb(value);
+                        }
+                    }
+                    for (handles, level) in self.batteries.iter_mut() {
+                        if handles.level == notified {
+                            if let Some(fresh) = crate::link::parse_battery_level(value) {
+                                *level = Some(fresh);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut heard = false;
+            while let Some(samples) = capture.next_frame(frame)? {
+                if !is_silent(&samples) {
+                    heard = true;
+                    break;
+                }
+            }
+
+            if heard {
+                return Ok(true);
+            }
+
+            // Fifty milliseconds rather than two hundred. The link is being
+            // serviced from this loop now, and a signalling request that waits a
+            // fifth of a second for its answer is a request the peer may already
+            // have given up on. It is still one wake-up per twenty, not one per
+            // frame, so the saving this interval existed for is intact.
+            clock.sleep(Duration::from_millis(50));
         }
     }
 
@@ -1757,6 +2457,21 @@ mod tests {
     }
 
     #[test]
+    fn balance_only_ever_turns_one_side_down() {
+        let mut frame = vec![10_000i16, 10_000, -10_000, -10_000];
+        apply_balance(&mut frame, 0.5);
+        assert_eq!(frame, vec![5_000, 10_000, -5_000, -10_000], "right untouched");
+
+        let mut frame = vec![10_000i16, 10_000];
+        apply_balance(&mut frame, -1.0);
+        assert_eq!(frame, vec![10_000, 0], "fully left silences the right");
+
+        let mut frame = vec![10_000i16, -10_000];
+        apply_balance(&mut frame, 0.0);
+        assert_eq!(frame, vec![10_000, -10_000], "centre changes nothing");
+    }
+
+    #[test]
     fn dither_still_counts_as_silence() {
         // What Windows actually sends when nothing is playing.
         let quiet: Vec<i16> = (0..480).map(|i| if i % 7 == 0 { 1 } else { 0 }).collect();
@@ -1774,9 +2489,9 @@ mod tests {
 
         assert!(policy.enabled);
         assert!(policy.should_retry(Duration::from_secs(0)));
-        assert!(policy.should_retry(Duration::from_secs(119)));
-        assert!(!policy.should_retry(Duration::from_secs(120)));
-        assert_eq!(policy.attempts_in_window(), Some(24));
+        assert!(policy.should_retry(Duration::from_secs(899)));
+        assert!(!policy.should_retry(Duration::from_secs(900)));
+        assert_eq!(policy.attempts_in_window(), Some(300));
     }
 
     #[test]
@@ -1802,6 +2517,14 @@ mod tests {
     }
 
     #[test]
+    fn silence_does_not_hand_the_headphones_away_by_default() {
+        // Releasing the endpoints costs a full stream rebuild to undo, and
+        // nothing here can tell whether another device wants them. Somebody who
+        // switches between a phone and this PC can turn it on.
+        assert_eq!(SessionConfig::default().multipoint_yield, None);
+    }
+
+    #[test]
     fn the_default_plays_at_full_quality() {
         let config = SessionConfig::default();
 
@@ -1809,7 +2532,11 @@ mod tests {
         // encoder ever saw the signal. The soft-start ramp and the garbage
         // screen are what protect the listener now.
         assert_eq!(config.limiter.gain(), 1.0, "the default must be transparent");
-        assert!(config.prefer_single_cis, "one CIS is the safer topology");
+
+        // Two streams, because that is the layout Windows negotiates and the
+        // only one this stack has been proven against. The plan builder still
+        // falls back to one stream for a device with a single Sink ASE.
+        assert!(!config.prefer_single_cis, "the proven topology is two streams");
     }
 
     #[test]

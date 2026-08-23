@@ -10,9 +10,11 @@ pub mod att;
 pub mod bap;
 pub mod bonding;
 pub mod controller;
+pub mod environment;
 pub mod hci;
 pub mod l2cap;
 pub mod link;
+pub mod multipoint;
 pub mod safety;
 #[cfg(windows)]
 pub mod session;

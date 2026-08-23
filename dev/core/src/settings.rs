@@ -96,6 +96,26 @@ pub const KNOBS: &[Knob] = &[
         description: "delay between receiving and presenting audio at the headphones",
     },
     Knob {
+        key: "balance",
+        scope: ApplyScope::Immediately,
+        description: "left/right balance from -50 (only left) through 0 (even) to +50 (only right)",
+    },
+    Knob {
+        key: "idle_link_latency",
+        scope: ApplyScope::OnReconnect,
+        description: "how many control-channel wake-ups the headphones may skip while audio plays; higher saves their battery, 0 leaves the link untouched",
+    },
+    Knob {
+        key: "battery_poll_min",
+        scope: ApplyScope::Immediately,
+        description: "how often to ask the headphones for their battery level, on top of the updates they send by themselves",
+    },
+    Knob {
+        key: "link_timeout_s",
+        scope: ApplyScope::OnReconnect,
+        description: "how long the link may go unheard before it counts as lost; longer survives walking out of range and back",
+    },
+    Knob {
         key: "swap_channels",
         scope: ApplyScope::Immediately,
         description: "swap left and right when the headphones play the channels in reverse",
@@ -151,14 +171,32 @@ pub const KNOBS: &[Knob] = &[
         description: "gain applied to received microphone audio; 1.0 is unchanged",
     },
     Knob {
+        key: "multipoint_yield_enabled",
+        scope: ApplyScope::OnReconnect,
+        description: "release the headphones after a period of silence so another device, such as a phone, can take them, and take them back automatically when this PC plays again. The headphones have to support multipoint themselves - this side of it cannot be added by software, and on a headset that only holds one connection at a time releasing simply means a short pause before playback resumes",
+    },
+    Knob {
+        key: "multipoint_yield_s",
+        scope: ApplyScope::OnReconnect,
+        description: "how long silence must last before the headphones are released; too short and they change hands between tracks",
+    },
+    Knob {
+        key: "link_metrics",
+        scope: ApplyScope::OnReconnect,
+        description: "how closely the radio is monitored while playing: none, signal only, or signal and packet loss; monitoring costs a little battery on both ends",
+    },
+    Knob {
         key: "diagnostics",
         scope: ApplyScope::OnReconnect,
         description: "print each stream state after channel establishment",
     },
     Knob {
         key: "device",
-        scope: ApplyScope::OnReconnect,
-        description: "preferred headphones to connect",
+        // Read by the application when it decides what to connect to, not by
+        // the stack while a stream is running, so there is nothing to reconnect
+        // for.
+        scope: ApplyScope::Immediately,
+        description: "headphones to reach for first when connecting automatically; any paired device is used if these are not around",
     },
     Knob {
         key: "gain",
@@ -168,22 +206,22 @@ pub const KNOBS: &[Knob] = &[
     Knob {
         key: "idle_timeout_min",
         scope: ApplyScope::OnReconnect,
-        description: "stop transmitting after this much silence; 0 disables the feature",
+        description: "stop transmitting after this much silence, keeping the connection and both streams up; 0 never stops. Only takes effect when releasing for other devices is switched off, since that happens after seconds rather than minutes",
     },
     Knob {
         key: "reconnect_enabled",
-        scope: ApplyScope::OnReconnect,
-        description: "try to reconnect after losing radio range",
+        scope: ApplyScope::Immediately,
+        description: "reconnect automatically after losing radio range",
     },
     Knob {
         key: "reconnect_interval_s",
-        scope: ApplyScope::OnReconnect,
-        description: "how often to retry",
+        scope: ApplyScope::Immediately,
+        description: "how often to retry after losing range",
     },
     Knob {
         key: "reconnect_window_min",
-        scope: ApplyScope::OnReconnect,
-        description: "how long to retry before stopping; 0 means unlimited",
+        scope: ApplyScope::Immediately,
+        description: "how long to keep retrying before giving up; 0 means never give up",
     },
     Knob {
         key: "startup_reconnect_enabled",
@@ -243,7 +281,11 @@ impl Settings {
     /// but their saved values stayed, and kept configuring the wrong ASEs with
     /// the ears swapped - invisibly, because nothing in the app showed them any
     /// more. A setting with no control is a setting nobody can find.
-    pub const VERSION: &'static str = "5";
+    ///
+    /// Version 6 removed `winning_variant`, written by the compatibility
+    /// profile that tried six stream shapes in turn. The profile is gone; a file
+    /// still naming a shape that no longer exists is only confusing.
+    pub const VERSION: &'static str = "8";
 
     /// The defaults, which is also what the reset button restores.
     pub fn defaults() -> Self {
@@ -272,13 +314,41 @@ impl Settings {
         settings.set("monitor_gain", "1.0");
         settings.set("microphone_gain", "1.0");
         settings.set("swap_channels", "false");
+        settings.set("balance", "0");
+        // Five seconds is what the trace shows Windows asking for, and it is
+        // also the reason a walk to the kitchen ends the connection. Ten leaves
+        // room to step out of range and back without the link being declared
+        // dead, and costs nothing while the headphones are in range: the timeout
+        // only decides how long silence is tolerated before giving up.
+        settings.set("link_timeout_s", "10");
+        // One small packet each way, four times an hour. Headsets are supposed
+        // to notify when the level moves and most do, but a headset that
+        // subscribes and then stays silent shows a battery frozen at whatever it
+        // was on connect, and there is no way to tell those apart without
+        // asking. Set to 0 to ask nothing and rely on notifications alone.
+        settings.set("battery_poll_min", "15");
+        // Off by default, deliberately. It is the largest saving available on
+        // the headphones' side and it changes the timing of a link that this
+        // stack has spent a long time getting to behave. Somebody who wants the
+        // battery back can have it; nobody gets a connection quirk they did not
+        // ask for.
+        settings.set("idle_link_latency", "0");
         settings.set("diagnostics", "true");
+        settings.set("link_metrics", "full");
+        // Off. Releasing the endpoints during silence hands the headphones to
+        // nobody when nothing else is asking for them - and it costs a full
+        // stream rebuild to get them back, which is the expensive half of a
+        // reconnect. Worth having for someone who really does switch between a
+        // phone and this PC all day; not worth doing to everyone else by
+        // default.
+        settings.set("multipoint_yield_enabled", "false");
+        settings.set("multipoint_yield_s", "5");
         settings.set("command_style", "class-device");
         settings.set("gain", "1.0");
         settings.set("idle_timeout_min", "5");
         settings.set("reconnect_enabled", "true");
-        settings.set("reconnect_interval_s", "5");
-        settings.set("reconnect_window_min", "3");
+        settings.set("reconnect_interval_s", "3");
+        settings.set("reconnect_window_min", "15");
         settings.set("startup_reconnect_enabled", "true");
         settings.set("language", "en");
         settings.set("run_in_background", "false");
@@ -498,8 +568,9 @@ version = 1
         assert_eq!(defaults.bool("startup_reconnect_enabled"), Some(true));
         assert_eq!(
             defaults.minutes("reconnect_window_min"),
-            Some(Some(Duration::from_secs(180)))
+            Some(Some(Duration::from_secs(900)))
         );
+        assert_eq!(defaults.number("reconnect_interval_s"), Some(3.0));
     }
 
     #[test]

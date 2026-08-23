@@ -234,9 +234,22 @@ impl StreamPlan {
         let mut rejection = None;
         let mut chosen = None;
 
+        // Two channels on two streams is the layout Windows negotiates and the
+        // one this stack has actually been proven against. Carrying both on one
+        // stream is fewer links to establish - genuinely better when it works -
+        // but it is also the branch nothing has ever tested on hardware, because
+        // the reference headset cannot do it.
+        //
+        // So it is used when the caller asks for it, and when there is no
+        // alternative: a device with a single Sink ASE has no second stream to
+        // put the other ear on, and forcing the two-stream layout there would
+        // quietly fold its stereo into a mono mix.
+        let one_endpoint_only = capabilities.sink_ase_ids.len() < 2;
+
         for record in &records {
             let caps = &record.capabilities;
-            let single = prefer_single_cis && caps.supports_stereo_in_one_stream();
+            let single = caps.supports_stereo_in_one_stream()
+                && (prefer_single_cis || one_endpoint_only);
             let codec = preset.codec(single);
 
             match caps.accepts(&codec) {
@@ -1515,6 +1528,35 @@ mod tests {
         let encoded_tone = encoder.encode_channel(0, &tone).unwrap();
 
         assert_ne!(encoded_silence, encoded_tone, "encoder must react to input");
+    }
+
+    #[test]
+    fn a_device_with_one_endpoint_still_gets_both_ears() {
+        // One Sink ASE and stereo on one stream: the two-stream layout has
+        // nowhere to put the right channel, so it must not be chosen even
+        // though it is otherwise preferred.
+        let capabilities = synthetic_capabilities(true, 1);
+
+        let plan = StreamPlan::build(&capabilities, Preset::WindowsDefault, false)
+            .expect("a single-endpoint device is still playable");
+
+        assert_eq!(plan.topology, Topology::SingleCis);
+        assert_eq!(plan.channel_allocation(0), crate::bap::LOCATION_STEREO);
+    }
+
+    #[test]
+    fn two_endpoints_use_the_layout_windows_negotiates() {
+        // The same device with two endpoints takes the proven path, even though
+        // it could carry both channels on one stream.
+        let capabilities = synthetic_capabilities(true, 4);
+
+        let plan = StreamPlan::build(&capabilities, Preset::WindowsDefault, false)
+            .expect("plannable");
+
+        assert_eq!(plan.topology, Topology::DualCis);
+        assert_eq!(plan.ase_ids.len(), 2);
+        assert_eq!(plan.channel_allocation(0), crate::bap::LOCATION_FRONT_LEFT);
+        assert_eq!(plan.channel_allocation(1), crate::bap::LOCATION_FRONT_RIGHT);
     }
 
     #[test]

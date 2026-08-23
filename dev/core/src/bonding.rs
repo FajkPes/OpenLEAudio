@@ -21,8 +21,18 @@ use std::path::{Path, PathBuf};
 /// One remembered device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bond {
-    /// Public address, in display form.
+    /// The address, in display form.
     pub address: String,
+    /// 0 for a public address, 1 for a random one.
+    ///
+    /// Stored because reconnecting needs it and an advertisement may not be
+    /// available at the time: LE Create Connection has to be told which kind of
+    /// address it is aiming at, and guessing "public" for a peer that uses a
+    /// random static address means the attempt simply never completes. That
+    /// looked exactly like headphones out of range, which is why automatic
+    /// reconnect appeared to do nothing while connecting by hand - after a
+    /// scan, which does report the type - worked.
+    pub address_type: u8,
     pub name: String,
     /// The long term key, as agreed during pairing.
     pub long_term_key: [u8; 16],
@@ -95,15 +105,15 @@ impl BondStore {
         let mut text = String::from(
             "# OpenLEAudio paired devices\n\
              # WARNING: this file contains encryption keys. Do not share it.\n\
-             # address | name | LE Audio | key\n\n",
+             # address | name | LE Audio | key | address type\n\n",
         );
 
         for bond in self.bonds.values() {
             let key: String = bond.long_term_key.iter().map(|b| format!("{b:02X}")).collect();
             let name = bond.name.replace('|', "/");
             text.push_str(&format!(
-                "{} | {} | {} | {}\n",
-                bond.address, name, bond.le_audio, key
+                "{} | {} | {} | {} | {}\n",
+                bond.address, name, bond.le_audio, key, bond.address_type
             ));
         }
 
@@ -119,8 +129,13 @@ impl BondStore {
                 continue;
             }
 
+            // The address type is a later addition. A file without it is not
+            // damaged, it is simply older, and dropping those entries would
+            // unpair every device on upgrade.
             let fields: Vec<&str> = line.split('|').map(|f| f.trim()).collect();
-            let [address, name, le_audio, key] = fields.as_slice() else {
+            let ([address, name, le_audio, key] | [address, name, le_audio, key, _]) =
+                fields.as_slice()
+            else {
                 continue;
             };
 
@@ -130,6 +145,10 @@ impl BondStore {
 
             store.insert(Bond {
                 address: address.to_string(),
+                address_type: fields
+                    .get(4)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0),
                 name: name.to_string(),
                 le_audio: *le_audio == "true",
                 long_term_key,
@@ -173,6 +192,7 @@ mod tests {
     fn bond(address: &str, name: &str) -> Bond {
         Bond {
             address: address.into(),
+            address_type: 0,
             name: name.into(),
             long_term_key: [0xAB; 16],
             le_audio: true,
@@ -218,6 +238,30 @@ mod tests {
         assert!(store.remove("7c:fe:62:72:b4:9a"));
         assert!(!store.remove("7C:FE:62:72:B4:9A"));
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn a_file_without_an_address_type_still_keeps_its_devices() {
+        // Written before the field existed. Refusing these lines would unpair
+        // every device the moment someone updated.
+        let store = BondStore::from_text(
+            "7C:FE:62:72:B4:9A | JBL | true | ABABABABABABABABABABABABABABABAB
+",
+        );
+
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get("7C:FE:62:72:B4:9A").unwrap().address_type, 0);
+    }
+
+    #[test]
+    fn a_random_address_survives_a_round_trip() {
+        let mut store = BondStore::new();
+        let mut random = bond("7C:FE:62:72:B4:9A", "JBL Tune 780NC");
+        random.address_type = 1;
+        store.insert(random);
+
+        let reloaded = BondStore::from_text(&store.to_text());
+        assert_eq!(reloaded.get("7C:FE:62:72:B4:9A").unwrap().address_type, 1);
     }
 
     #[test]

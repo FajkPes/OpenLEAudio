@@ -21,6 +21,45 @@ use crate::transport::UsbTransport;
 pub const ATT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Handles reserved by the SIG for PACS and ASCS characteristics.
+/// Battery Service, as assigned by the Bluetooth SIG.
+pub mod battery_uuid {
+    pub const SERVICE: u16 = 0x180F;
+    pub const LEVEL: u16 = 0x2A19;
+}
+
+/// Where one battery lives on the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatteryHandles {
+    pub level: u16,
+    pub level_cccd: u16,
+    /// Whether the device will tell us when the level changes, or whether it
+    /// has to be asked. Asking costs a round trip and some airtime, so it is
+    /// worth knowing which of the two this is.
+    pub notifies: bool,
+}
+
+/// Splits an Audio Contexts value into its sink and source halves.
+///
+/// Both Available and Supported Audio Contexts use the same layout: a 16-bit
+/// context bitmap for streams towards the device, then one for streams from it.
+pub fn parse_context_pair(value: &[u8]) -> (Option<u16>, Option<u16>) {
+    let sink = (value.len() >= 2).then(|| u16::from_le_bytes([value[0], value[1]]));
+    let source = (value.len() >= 4).then(|| u16::from_le_bytes([value[2], value[3]]));
+    (sink, source)
+}
+
+/// A Battery Level value: one byte, 0 to 100 per cent.
+///
+/// Values above 100 are rejected rather than clamped. A device sending 255 is
+/// not reporting a very full battery, it is reporting that it does not know,
+/// and showing that as full is worse than showing nothing.
+pub fn parse_battery_level(value: &[u8]) -> Option<u8> {
+    match value {
+        [percent, ..] if *percent <= 100 => Some(*percent),
+        _ => None,
+    }
+}
+
 pub mod pacs_uuid {
     pub const SINK_PAC: u16 = 0x2BC9;
     pub const SINK_AUDIO_LOCATIONS: u16 = 0x2BCA;
@@ -191,8 +230,20 @@ pub struct AudioCapabilities {
     pub sink_records: Vec<PacRecord>,
     pub source_records: Vec<PacRecord>,
     pub sink_locations: Option<u32>,
+    /// Contexts the device can accept *right now*, for streams towards it.
+    ///
+    /// The specification calls this Available Audio Contexts, and it is the one
+    /// standard, vendor-neutral way to tell that a headset is already busy with
+    /// another host: a device holding a second connection publishes fewer
+    /// available contexts than it supports. Nothing else in BAP reports
+    /// multipoint, and every vendor's own protocol says it differently.
     pub available_contexts: Option<u16>,
+    /// The same, for streams coming from the device - its microphone.
+    pub available_source_contexts: Option<u16>,
     pub supported_contexts: Option<u16>,
+    pub supported_source_contexts: Option<u16>,
+    /// Where Available Audio Contexts lives, so changes can be subscribed to.
+    pub available_contexts_handle: Option<u16>,
     pub sink_ase_ids: Vec<u8>,
     pub source_ase_ids: Vec<u8>,
 }
@@ -736,6 +787,51 @@ impl Link {
         }))
     }
 
+    /// Finds every Battery Service the device publishes.
+    ///
+    /// Plural on purpose. A pair of earbuds commonly exposes one instance per
+    /// side and sometimes a third for the case, and each is a separate primary
+    /// service with its own Battery Level characteristic. Reading only the first
+    /// one reports the left earbud's charge as though it were the device's, and
+    /// then the number stops moving when that side is the one still full.
+    ///
+    /// Absence is normal, not an error: plenty of headphones publish no battery
+    /// information at all over GATT.
+    pub fn discover_batteries(&mut self) -> Result<Vec<BatteryHandles>> {
+        let services = self.discover_services()?;
+        let mut found = Vec::new();
+
+        for range in services
+            .iter()
+            .filter(|s| s.uuid.as_short() == Some(battery_uuid::SERVICE))
+        {
+            let characteristics = self.discover_characteristics(range)?;
+            let Some(level) = characteristics
+                .iter()
+                .find(|c| c.uuid.as_short() == Some(battery_uuid::LEVEL))
+            else {
+                continue;
+            };
+
+            found.push(BatteryHandles {
+                level: level.value_handle,
+                // The Client Characteristic Configuration descriptor sits
+                // directly after the value it configures, exactly as it does
+                // for volume state.
+                level_cccd: level.value_handle + 1,
+                notifies: level.supports_notify(),
+            });
+        }
+
+        Ok(found)
+    }
+
+    /// Reads one battery level as a percentage, as the specification defines it.
+    pub fn read_battery_level(&mut self, handle: u16) -> Result<Option<u8>> {
+        let value = self.read_characteristic(handle)?;
+        Ok(parse_battery_level(&value))
+    }
+
     /// Reads the volume the headphones currently hold.
     pub fn read_volume_state(&mut self, handle: u16) -> Result<Option<crate::vcs::VolumeState>> {
         let value = self.read_characteristic(handle)?;
@@ -783,18 +879,23 @@ impl Link {
             }
         }
 
+        // Four bytes, not two: sink contexts then source contexts. Reading only
+        // the first half meant the microphone direction was never checked at
+        // all, and a device that had made its Source unavailable looked
+        // perfectly ready right up until the stream refused to start.
         if let Some(c) = service.characteristic(pacs_uuid::AVAILABLE_CONTEXTS) {
+            capabilities.available_contexts_handle = Some(c.value_handle);
             let value = self.read_characteristic(c.value_handle)?;
-            if value.len() >= 2 {
-                capabilities.available_contexts = Some(u16::from_le_bytes([value[0], value[1]]));
-            }
+            let (sink, source) = parse_context_pair(&value);
+            capabilities.available_contexts = sink;
+            capabilities.available_source_contexts = source;
         }
 
         if let Some(c) = service.characteristic(pacs_uuid::SUPPORTED_CONTEXTS) {
             let value = self.read_characteristic(c.value_handle)?;
-            if value.len() >= 2 {
-                capabilities.supported_contexts = Some(u16::from_le_bytes([value[0], value[1]]));
-            }
+            let (sink, source) = parse_context_pair(&value);
+            capabilities.supported_contexts = sink;
+            capabilities.supported_source_contexts = source;
         }
 
         // ASCS tells us how many streams can run at once, and their ids.

@@ -6,10 +6,12 @@ title OpenLEAudio - install dependencies
 set "SETUPDIR=%~dp0dependencies"
 set "DOTNET=%SETUPDIR%\windowsdesktop-runtime-8-x64.exe"
 set "WASDK=%SETUPDIR%\windows-app-runtime-1.8-x64.exe"
+set "VCREDIST=%SETUPDIR%\vc-redist-2015-2022-x64.exe"
 if not exist "%SETUPDIR%" mkdir "%SETUPDIR%"
 
 set "NEEDDOTNET=0"
 set "NEEDWASDK=0"
+set "NEEDVC=0"
 where dotnet.exe >nul 2>nul
 if errorlevel 1 (
     set "NEEDDOTNET=1"
@@ -21,7 +23,17 @@ powershell.exe -NoProfile -NonInteractive -Command ^
   "if (Get-AppxPackage -Name 'Microsoft.WindowsAppRuntime.1.8*' -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"
 if errorlevel 1 set "NEEDWASDK=1"
 
-if "%NEEDDOTNET%"=="0" if "%NEEDWASDK%"=="0" (
+REM The Visual C++ 2015-2022 runtime. The Windows App SDK links against it and
+REM so does the Rust core, but neither installer brings it: on a clean Windows
+REM the app starts and dies immediately with no window and no message, which is
+REM indistinguishable from a corrupt download. Checked by the files themselves
+REM rather than the registry, because a repair install can leave the key behind
+REM after the DLLs have gone.
+if not exist "%SystemRoot%\System32\vcruntime140.dll" set "NEEDVC=1"
+if not exist "%SystemRoot%\System32\vcruntime140_1.dll" set "NEEDVC=1"
+if not exist "%SystemRoot%\System32\msvcp140.dll" set "NEEDVC=1"
+
+if "%NEEDDOTNET%"=="0" if "%NEEDWASDK%"=="0" if "%NEEDVC%"=="0" (
     echo All required dependencies are already installed.
     exit /b 0
 )
@@ -43,6 +55,22 @@ if "%NEEDWASDK%"=="1" if not exist "%WASDK%" (
     if errorlevel 1 goto :fail
 ) else (
     echo Using the cached Windows App Runtime installer from the dependencies directory.
+)
+
+if "%NEEDVC%"=="1" if not exist "%VCREDIST%" (
+    echo Downloading Microsoft Visual C++ 2015-2022 Redistributable...
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
+      "Invoke-WebRequest -UseBasicParsing -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile '%VCREDIST%'"
+    if errorlevel 1 goto :fail
+) else (
+    if "%NEEDVC%"=="1" echo Using the cached Visual C++ installer from the dependencies directory.
+)
+
+if "%NEEDVC%"=="1" (
+    echo Installing Visual C++ 2015-2022 Redistributable...
+    start /wait "" "%VCREDIST%" /install /quiet /norestart
+    REM 3010 means "installed, restart required", which is a success.
+    if errorlevel 3011 goto :fail
 )
 
 if "%NEEDDOTNET%"=="1" (

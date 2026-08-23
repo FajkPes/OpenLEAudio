@@ -49,6 +49,31 @@ $DriverDir = Join-Path (Split-Path $PSScriptRoot -Parent) 'driver'
 $InfPath = Join-Path $DriverDir 'olea_winusb.inf'
 $CatPath = Join-Path $DriverDir 'olea_winusb.cat'
 
+# Windows gives no sign of life while it installs drivers or reconfigures audio
+# endpoints, and these steps take tens of seconds. Without a line saying so the
+# window looks finished and gets closed halfway through. Every long step is
+# announced before it starts, and the end is unmistakable.
+function Start-Step {
+    param([string] $Text, [string] $Expect = 'this can take up to a minute')
+    Write-Host ""
+    Write-Host "-> $Text" -ForegroundColor Cyan
+    Write-Host "   Working - $Expect. Do not close this window." -ForegroundColor DarkGray
+}
+
+function Complete-Step {
+    param([string] $Text = 'Done.')
+    Write-Host "   $Text" -ForegroundColor DarkGray
+}
+
+function Complete-Script {
+    param([string] $Text)
+    Write-Host ""
+    Write-Host ("=" * 66)
+    Write-Host "  FINISHED - $Text" -ForegroundColor Green
+    Write-Host "  Nothing else is running. This window can be closed."
+    Write-Host ("=" * 66)
+}
+
 function Test-Elevated {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal $identity).IsInRole(
@@ -195,8 +220,8 @@ function Invoke-Remove {
 }
 
 switch ($PSCmdlet.ParameterSetName) {
-    'Sign'   { Invoke-Sign }
-    'Remove' { Invoke-Remove }
-    default  { Show-Status }
+    'Sign'   { Invoke-Sign;   Complete-Script "the driver package is signed" }
+    'Remove' { Invoke-Remove; Complete-Script "the temporary signing certificates were removed" }
+    default  { Show-Status;   Complete-Script "this was a read-only check - nothing was changed" }
 }
 

@@ -57,6 +57,31 @@ $FriendlyName = '{a45c254e-df1c-4efd-8020-67d146a850e0},2'
 $DeviceFormat = '{f19f064d-082c-4e27-bc73-6882a1bb8e4c},0'
 $BackupFile = Join-Path (Split-Path $PSScriptRoot -Parent) 'runtime-data\vbcable-backup.json'
 
+# Windows gives no sign of life while it installs drivers or reconfigures audio
+# endpoints, and these steps take tens of seconds. Without a line saying so the
+# window looks finished and gets closed halfway through. Every long step is
+# announced before it starts, and the end is unmistakable.
+function Start-Step {
+    param([string] $Text, [string] $Expect = 'this can take up to a minute')
+    Write-Host ""
+    Write-Host "-> $Text" -ForegroundColor Cyan
+    Write-Host "   Working - $Expect. Do not close this window." -ForegroundColor DarkGray
+}
+
+function Complete-Step {
+    param([string] $Text = 'Done.')
+    Write-Host "   $Text" -ForegroundColor DarkGray
+}
+
+function Complete-Script {
+    param([string] $Text)
+    Write-Host ""
+    Write-Host ("=" * 66)
+    Write-Host "  FINISHED - $Text" -ForegroundColor Green
+    Write-Host "  Nothing else is running. This window can be closed."
+    Write-Host ("=" * 66)
+}
+
 function Test-Elevated {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal $identity).IsInRole(
@@ -67,7 +92,7 @@ if ($Install) {
     $installed = Get-CimInstance Win32_SoundDevice -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -like '*VB-Audio*' -or $_.Name -like '*CABLE Input*' }
     if ($installed) {
-        Write-Host "VB-CABLE is already installed." -ForegroundColor Green
+        Complete-Script "VB-CABLE is already installed - nothing to do"
         exit 0
     }
 
@@ -94,10 +119,10 @@ if ($Install) {
         Select-Object -First 1
     if (-not $installer) { throw "VBCABLE_Setup_x64.exe was not found in the downloaded package." }
 
-    Write-Host "Starting the official VB-CABLE installer. Choose Install Driver, then restart Windows when prompted."
+    Start-Step "Starting the official VB-CABLE installer" "it opens its own window - choose Install Driver there"
     $process = Start-Process -FilePath $installer.FullName -Verb RunAs -Wait -PassThru
     if ($process.ExitCode -ne 0) { throw "VB-CABLE installer exited with code $($process.ExitCode)." }
-    Write-Host "VB-CABLE installer finished. Restart Windows before configuration." -ForegroundColor Green
+    Complete-Script "VB-CABLE is installed. Restart Windows, then run the configuration step"
     exit 0
 }
 
@@ -422,7 +447,7 @@ if ($changes.Count -eq 0) {
 # ---- Apply ----
 
 if (-not $Apply) {
-    Write-Host ""
+    Complete-Script "this was a read-only check - nothing was changed"
     return
 }
 
@@ -486,8 +511,6 @@ if (-not $KeepDefaultDevice) {
 }
 
 Write-Host ""
-Write-Host "  Done. Changes take effect immediately and no restart is required." -ForegroundColor Green
-Write-Host ""
 Write-Host "  Restore the previous state with 'VB-CABLE - restore.bat'."
-Write-Host ""
+Complete-Script "the cable is configured. Changes are already in effect - no restart needed"
 

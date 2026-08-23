@@ -12,6 +12,14 @@
 ; machine and leave the user with no working Bluetooth at all. Each adapter must be
 ; opted in by hardware ID, and installed against one device instance.
 ;
+; To support another adapter, run "ADD Bluetooth adapter.bat". It reads the
+; hardware IDs out of Windows' own device enumeration, filtered to the USB
+; Bluetooth class, and writes them here - so an entry can only ever name a real
+; Bluetooth controller that is really present on the machine. That keeps the
+; opt-in-per-adapter property above while removing the need to know any ID in
+; advance. Editing this list by hand works too; the catalog must be re-signed
+; either way.
+;
 ; To undo: Device Manager -> the adapter -> Update driver -> pick the original,
 ; or run scripts/uninstall.ps1, which restores the recorded previous binding.
 ;
@@ -29,8 +37,9 @@ PnpLockdown = 1
 %ProviderName% = OpenLeAudio, NTamd64.10.0...17763
 
 ; ---------------------------------------------------------------------------
-; Supported adapters. Add a line per adapter you want the stack to drive.
-; ASUS USB-BT600 (Realtek) is the reference device this was developed against.
+; Supported adapters, one line each. ASUS USB-BT600 (Realtek) is the reference
+; device this was developed against; "ADD Bluetooth adapter.bat" appends the
+; others. Order does not matter - Windows matches on the id, not the position.
 ; ---------------------------------------------------------------------------
 [OpenLeAudio.NTamd64.10.0...17763]
 %Device.BT600% = WinUsbInstall, USB\VID_0B05&PID_1D70

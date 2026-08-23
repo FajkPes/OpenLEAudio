@@ -107,6 +107,16 @@ pub struct Controller {
     /// Whether the last scan used the extended commands, which decides how a
     /// connection must be requested afterwards.
     extended_scan: bool,
+
+    /// How long the link may go unheard before the controller declares it lost,
+    /// in units of 10 ms.
+    ///
+    /// Five seconds is what the Windows driver asks for, and it is also why
+    /// stepping out of range for a moment ends the connection rather than
+    /// interrupting it: the ACL is gone before the headphones are back. The user
+    /// gets to choose, because the cost of a longer value is only that a link
+    /// that really has died takes proportionally longer to be noticed.
+    supervision_timeout: u16,
 }
 
 impl Controller {
@@ -127,6 +137,7 @@ impl Controller {
             local_version: None,
             local_address: None,
             extended_scan: false,
+            supervision_timeout: 0x03E8, // 10 s
         })
     }
 
@@ -298,6 +309,12 @@ impl Controller {
     }
 
     /// True when the last scan used the extended commands.
+    /// Sets the link supervision timeout used by the next connection attempt.
+    pub fn set_supervision_timeout(&mut self, timeout: Duration) {
+        let units = (timeout.as_millis() / 10).clamp(1, u16::MAX as u128) as u16;
+        self.supervision_timeout = hci::clamp_supervision(units);
+    }
+
     pub fn used_extended_scan(&self) -> bool {
         self.extended_scan
     }
@@ -334,26 +351,54 @@ impl Controller {
 
     /// Waits for an event matching a predicate, ignoring everything else.
     ///
-    /// Unmatched events are dropped rather than queued: this is used while
-    /// waiting for a connection, where a backlog of advertising reports is of no
-    /// interest and would otherwise grow without bound.
+    /// Events that do not match are kept, except the two kinds that arrive in
+    /// bulk and mean nothing later: advertising reports and completed-packet
+    /// counts. Everything else goes back in the queue.
+    ///
+    /// This used to discard all of them, and the one that mattered was
+    /// Disconnection Complete. Waiting up to eight seconds for an isochronous
+    /// channel that never comes up is exactly when the peer is most likely to
+    /// drop the ACL link - and the notice that it had was thrown away here. The
+    /// stack then retried against a connection handle the controller no longer
+    /// knew, and LE Create CIS answered "unknown connection identifier", which
+    /// reads as the isochronous channels being refused rather than as the
+    /// connection having ended several seconds earlier.
     pub fn wait_for_event<F>(&mut self, timeout: Duration, mut matches: F) -> Result<Option<Event>>
     where
         F: FnMut(&Event) -> bool,
     {
         let deadline = Instant::now() + timeout;
+        let mut keep = Vec::new();
 
-        while Instant::now() < deadline {
+        let found = loop {
+            if Instant::now() >= deadline {
+                break None;
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             match self.next_event_timeout(remaining) {
-                Ok(event) if matches(&event) => return Ok(Some(event)),
-                Ok(_) => continue,
-                Err(ControllerError::EventTimeout) => break,
-                Err(e) => return Err(e),
+                Ok(event) if matches(&event) => break Some(event),
+                Ok(event) => {
+                    if !is_bulk_event(&event) {
+                        keep.push(event);
+                    }
+                }
+                Err(ControllerError::EventTimeout) => break None,
+                Err(e) => {
+                    // Put back what was collected before giving up, so an error
+                    // here does not also lose a disconnection nobody has read.
+                    for event in keep.into_iter().rev() {
+                        self.queued_events.push_front(event);
+                    }
+                    return Err(e);
+                }
             }
+        };
+
+        for event in keep.into_iter().rev() {
+            self.queued_events.push_front(event);
         }
 
-        Ok(None)
+        Ok(found)
     }
 
     /// Opens a connection to a peer and returns its handle.
@@ -376,9 +421,9 @@ impl Controller {
         // refuse a legacy connection request after extended scanning, and this
         // one is a Bluetooth 6.0 part where that is a real possibility.
         let request = if self.extended_scan {
-            hci::le_extended_create_connection(peer, address_type)
+            hci::le_extended_create_connection(peer, address_type, self.supervision_timeout)
         } else {
-            hci::le_create_connection(peer, address_type)
+            hci::le_create_connection(peer, address_type, self.supervision_timeout)
         };
         self.command(&request)?;
 
@@ -399,9 +444,28 @@ impl Controller {
                 })
             }
             None => {
-                // Nothing arrived in time. The controller may still be trying,
-                // so stop it before the caller retries.
+                // Nothing arrived in time. The controller is still trying, and
+                // it stays in the initiating state until it is told otherwise -
+                // every later LE Create Connection is then answered with
+                // "command disallowed".
+                //
+                // Sending the cancel is not enough on its own. The cancel is
+                // acknowledged immediately, but the attempt it aborts reports
+                // separately afterwards, as a Connection Complete carrying
+                // status 0x02. Returning before that arrives leaves the event in
+                // the queue for the *next* attempt to find, where it is read as
+                // that attempt's answer and fails it instantly - so a retry
+                // could never succeed, however long the peer had been back in
+                // range. This is why reconnecting by hand worked (the gap
+                // between two clicks is long enough for the event to be
+                // discarded by the next attempt's initial flush) while a prompt
+                // automatic retry did not.
                 let _ = self.command(&hci::le_create_connection_cancel());
+                let _ = self.wait_for_event(Duration::from_secs(2), |e| {
+                    e.connection_result().is_some()
+                });
+                self.clear_queued_events();
+                while self.pump.try_recv_event().is_some() {}
                 Ok(None)
             }
         }
@@ -444,6 +508,22 @@ impl Controller {
     pub fn clear_queued_events(&mut self) {
         self.queued_events.clear();
     }
+}
+
+/// Events that arrive continuously and carry nothing worth keeping.
+///
+/// Advertising reports appear by the hundred while scanning and every one of
+/// them is stale a moment later. Completed-packet counts are produced by every
+/// packet the host sends. Queueing either would grow without bound.
+fn is_bulk_event(event: &Event) -> bool {
+    if !crate::hci::parse_number_of_completed_packets(event).is_empty() {
+        return true;
+    }
+
+    matches!(
+        event.subevent(),
+        Some(hci::subevt::ADVERTISING_REPORT) | Some(hci::subevt::EXTENDED_ADVERTISING_REPORT)
+    )
 }
 
 /// Parses an LE Extended Advertising Report.

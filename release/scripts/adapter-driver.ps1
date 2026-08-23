@@ -51,6 +51,31 @@ $StateFile = Join-Path $RuntimeData 'adapter-state.json'
 $InfPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'driver\olea_winusb.inf'
 $SigningCertSubject = 'CN=OpenLEAudio Driver Signing'
 
+# Windows PnP produces nothing at all while it works, and the slow steps here
+# take tens of seconds. Without a line saying so, the window looks finished and
+# people close it - in the middle of a driver swap, which is the worst possible
+# moment. Every long operation is announced before it starts and confirmed after.
+function Start-Step {
+    param([string] $Text, [string] $Expect = 'this can take up to a minute')
+    Write-Host ""
+    Write-Host "-> $Text" -ForegroundColor Cyan
+    Write-Host "   Working - $Expect. Do not close this window." -ForegroundColor DarkGray
+}
+
+function Complete-Step {
+    param([string] $Text = 'Done.')
+    Write-Host "   $Text" -ForegroundColor DarkGray
+}
+
+function Complete-Script {
+    param([string] $Text)
+    Write-Host ""
+    Write-Host ("=" * 66)
+    Write-Host "  FINISHED - $Text" -ForegroundColor Green
+    Write-Host "  Nothing else is running. This window can be closed."
+    Write-Host ("=" * 66)
+}
+
 function Test-Elevated {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal $identity).IsInRole(
@@ -142,10 +167,10 @@ function Invoke-Bind {
     if ($binding['DEVPKEY_Device_Service'] -eq 'WinUSB') {
         # Already ours. The interface may still be unpublished if a previous run
         # was interrupted, so restart the device rather than doing nothing.
-        Write-Host "Adapter is already on WinUSB. Restarting the device to verify it..."
+        Start-Step "Adapter is already on WinUSB. Restarting the device to verify it" "usually a few seconds"
         & pnputil.exe /restart-device $device.InstanceId
-        Write-Host ""
-        Write-Host "Done. Verify with: PROBE - diagnostics.bat" -ForegroundColor Green
+        Complete-Step
+        Complete-Script "the adapter is on WinUSB. Verify with: PROBE - diagnostics.bat"
         return
     }
 
@@ -181,11 +206,11 @@ function Invoke-Bind {
         Provider   = $binding['DEVPKEY_Device_DriverProvider']
     } | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
 
-    Write-Host "Saved current binding to $StateFile"
+    Complete-Step "Saved current binding to $StateFile"
     Write-Host "  INF     : $($binding['DEVPKEY_Device_DriverInfPath'])"
     Write-Host "  Service : $($binding['DEVPKEY_Device_Service'])"
     Write-Host ""
-    Write-Host "Installing WinUSB binding..."
+    Start-Step "Installing the WinUSB binding"
 
     & pnputil.exe /add-driver $InfPath /install
 
@@ -197,9 +222,10 @@ function Invoke-Bind {
         throw "pnputil /add-driver failed with $LASTEXITCODE"
     }
 
-    Write-Host ""
-    Write-Host "Restarting the device so Windows registers the WinUSB interface..."
+    Complete-Step "Driver package installed."
+    Start-Step "Restarting the device so Windows registers the WinUSB interface" "usually a few seconds"
     & pnputil.exe /restart-device $device.InstanceId
+    Complete-Step
 
     # The signed package is now in the Driver Store. Remove the temporary
     # machine-wide trust and private key so they cannot later sign unrelated
@@ -209,18 +235,17 @@ function Invoke-Bind {
             Where-Object { $_.Subject -eq $SigningCertSubject } |
             ForEach-Object {
                 Remove-Item $_.PSPath -Force
-                Write-Host "Odebran docasny podpisovy certifikat z LocalMachine\$store"
+                Write-Host "   Removed the temporary signing certificate from LocalMachine\$store" -ForegroundColor DarkGray
             }
     }
     Get-ChildItem Cert:\CurrentUser\My -ErrorAction SilentlyContinue |
         Where-Object { $_.Subject -eq $SigningCertSubject } |
         ForEach-Object {
             Remove-Item $_.PSPath -Force
-            Write-Host "Odebran starsi uzivatelsky podpisovy klic"
+            Write-Host "   Removed an older user signing key" -ForegroundColor DarkGray
         }
 
-    Write-Host ""
-    Write-Host "Done. Verify with -Status." -ForegroundColor Yellow
+    Complete-Script "the adapter is on WinUSB. Restart OpenLEAudio so it opens the adapter again"
 }
 
 function Invoke-Restore {
@@ -240,8 +265,9 @@ function Invoke-Restore {
     # stay on WinUSB - the rollback would look like it ran and change nothing.
     $ourPackage = Find-OurDriverPackage
     if ($ourPackage) {
-        Write-Host "Removing the OpenLEAudio driver package: $ourPackage"
+        Start-Step "Removing the OpenLEAudio driver package: $ourPackage"
         & pnputil.exe /delete-driver $ourPackage /uninstall /force
+        Complete-Step
         if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
             Write-Warning "delete-driver skoncil s kodem $LASTEXITCODE, pokracuji."
         }
@@ -250,9 +276,15 @@ function Invoke-Restore {
     }
 
     Start-Sleep -Seconds 2
-    Write-Host "Scanning for hardware so Windows reinstalls the original driver..."
+    Start-Step "Scanning for hardware so Windows reinstalls the original driver"
     & pnputil.exe /scan-devices
-    Start-Sleep -Seconds 3
+
+    # The rescan returns before Windows has finished installing, so the check
+    # below would read the old binding and report a failure that had not
+    # happened. Waiting here is what makes the verdict mean something.
+    Complete-Step "Waiting for Windows to finish installing the original driver..."
+    Start-Sleep -Seconds 5
+    Complete-Step
 
     # Verify rather than assume. If the adapter is still on WinUSB the rollback
     # did not work, and saying so is more useful than a cheerful message.
@@ -277,11 +309,18 @@ function Invoke-Restore {
 
     Write-Host ""
     Show-Status
+    Complete-Script "the adapter has been put back on the Windows stack"
 }
 
+# Announced before the first slow call, because reading the binding itself has
+# to enumerate PnP and that is where the window sits silent on a cold start.
 switch ($PSCmdlet.ParameterSetName) {
     'Bind'    { Invoke-Bind }
     'Restore' { Invoke-Restore }
-    default   { Show-Status }
+    default   {
+        Start-Step "Reading the current adapter binding" "usually a few seconds"
+        Show-Status
+        Complete-Script "this was a read-only check - nothing was changed"
+    }
 }
 

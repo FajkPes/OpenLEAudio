@@ -20,7 +20,7 @@ use std::slice;
 
 use windows::core::PCWSTR;
 use windows::Win32::Media::Audio::{
-    eCapture, eRender, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice,
+    eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice,
     IMMDeviceEnumerator, MMDeviceEnumerator,
     AUDCLNT_SHAREMODE_SHARED, DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
@@ -30,7 +30,8 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority,
-    AVRT_PRIORITY_HIGH,
+    CreateWaitableTimerExW, SetWaitableTimer, WaitForSingleObject,
+    AVRT_PRIORITY_HIGH, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
 };
 use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 
@@ -55,7 +56,7 @@ pub enum AudioError {
     #[error("audio client error: {0}")]
     Client(String),
 
-    #[error("device runs at {actual} Hz with {channels} channels, but the stream needs {expected} Hz stereo")]
+    #[error("device delivers {channels} channels at {actual} Hz; the stream needs stereo (a rate other than {expected} Hz is converted, a channel count is not)")]
     FormatMismatch {
         actual: u32,
         channels: u16,
@@ -67,6 +68,89 @@ pub enum AudioError {
 }
 
 type Result<T> = std::result::Result<T, AudioError>;
+
+/// Sleeps until a deadline, accurately, without making the whole machine tick faster.
+///
+/// `std::thread::sleep` is built on the system timer, whose resolution is 15.6 ms
+/// unless something raises it globally. Asking it to wait 7.5 ms can therefore
+/// wait 15.6, which is two frame intervals - the stream then sends nothing for
+/// one interval and two back to back for the next. That is heard as the audio
+/// briefly stuttering, and no amount of buffering upstream fixes it because the
+/// fault is in when the packets leave.
+///
+/// The usual answer is `timeBeginPeriod(1)`, which raises the timer resolution
+/// for every process on the system: it fixes the stutter and costs measurable
+/// battery life doing it, on a laptop that may not even be playing anything a
+/// second later. A high-resolution waitable timer is precise to well under a
+/// millisecond, applies to this thread alone, and leaves the system tick rate
+/// where it was - so this is both the more accurate option and the cheaper one.
+///
+/// Falls back to an ordinary sleep when the timer cannot be created, which on
+/// Windows before 1803 is the expected outcome rather than a fault.
+pub struct PreciseTimer(Option<windows::Win32::Foundation::HANDLE>);
+
+// The handle is owned by this value and only ever waited on by the thread that
+// holds it. Nothing is shared, so it is safe to move between threads.
+unsafe impl Send for PreciseTimer {}
+
+impl PreciseTimer {
+    pub fn new() -> Self {
+        unsafe {
+            Self(
+                CreateWaitableTimerExW(
+                    None,
+                    None,
+                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_ALL_ACCESS.0,
+                )
+                .ok(),
+            )
+        }
+    }
+
+    /// Waits for `duration`. Returns immediately for zero or negative waits.
+    pub fn sleep(&self, duration: std::time::Duration) {
+        if duration.is_zero() {
+            return;
+        }
+
+        let Some(handle) = self.0 else {
+            std::thread::sleep(duration);
+            return;
+        };
+
+        // Negative means relative to now, in 100 ns units - the units the whole
+        // Win32 timer API is expressed in.
+        let due = -((duration.as_nanos() / 100) as i64);
+        if due == 0 {
+            return;
+        }
+
+        unsafe {
+            if SetWaitableTimer(handle, &due, 0, None, None, false).is_ok() {
+                WaitForSingleObject(handle, u32::MAX);
+            } else {
+                std::thread::sleep(duration);
+            }
+        }
+    }
+}
+
+impl Default for PreciseTimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PreciseTimer {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(handle);
+            }
+        }
+    }
+}
 
 /// Keeps the current thread in Windows' MMCSS "Pro Audio" scheduling class.
 ///
@@ -128,6 +212,52 @@ impl AudioDevice {
             .iter()
             .any(|hint| self.name.to_lowercase().contains(&hint.to_lowercase()))
     }
+}
+
+/// Rate-converts an interleaved block to an exact number of output frames.
+///
+/// Linear interpolation between neighbouring samples, per channel. Nearest
+/// neighbour is cheaper and is what the monitoring path uses, but it is audible
+/// on music: dropping and repeating samples puts a rough, grainy edge on
+/// anything with sustained high frequencies. Linear costs one multiply per
+/// sample and this runs on a few hundred of them per frame.
+///
+/// It is not a substitute for setting the cable to the right rate. A proper
+/// band-limited resampler would be better still; this exists so that a
+/// configuration below 48 kHz plays at all rather than failing outright.
+fn resample_interleaved(source: &[i16], channels: usize, output_frames: usize) -> Vec<i16> {
+    if channels == 0 || output_frames == 0 || source.is_empty() {
+        return Vec::new();
+    }
+
+    let input_frames = source.len() / channels;
+    if input_frames == 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(output_frames * channels);
+    // The last output frame maps to the last input frame, so the two blocks
+    // line up at both ends and no gap opens up between consecutive frames.
+    let step = if output_frames > 1 {
+        (input_frames - 1) as f32 / (output_frames - 1) as f32
+    } else {
+        0.0
+    };
+
+    for index in 0..output_frames {
+        let position = index as f32 * step;
+        let left = position.floor() as usize;
+        let right = (left + 1).min(input_frames - 1);
+        let fraction = position - left as f32;
+
+        for channel in 0..channels {
+            let a = source[left * channels + channel] as f32;
+            let b = source[right * channels + channel] as f32;
+            out.push((a + (b - a) * fraction) as i16);
+        }
+    }
+
+    out
 }
 
 /// Initialises COM for this thread. Safe to call more than once.
@@ -199,6 +329,93 @@ fn list_devices(flow: windows::Win32::Media::Audio::EDataFlow) -> Result<Vec<Aud
     }
 
     Ok(devices)
+}
+
+/// The shared-mode format Windows has an endpoint configured for.
+///
+/// This is what "Configure VB-CABLE" actually changes, and the difference
+/// between an installed cable and a usable one. A cable left at its 44.1 kHz
+/// default is installed, present in every list, and silently unusable: the
+/// capture side refuses to open because the rate does not match the codec, and
+/// the failure reads as a codec problem rather than a Windows setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndpointFormat {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub bits_per_sample: u16,
+}
+
+impl EndpointFormat {
+    pub fn describe(&self) -> String {
+        format!(
+            "{} Hz, {} channels, {} bit",
+            self.sample_rate, self.channels, self.bits_per_sample
+        )
+    }
+}
+
+/// Reads an endpoint's shared-mode format without opening a stream on it.
+///
+/// Deliberately does not call `Initialize`: asking a device what format it is in
+/// must never disturb whatever is already playing through it.
+pub fn endpoint_format(device_id: &str) -> Result<EndpointFormat> {
+    ensure_com()?;
+
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .map_err(|e| AudioError::Com(e.to_string()))?;
+
+        let wide: Vec<u16> = device_id.encode_utf16().chain(std::iter::once(0)).collect();
+        let device = enumerator
+            .GetDevice(PCWSTR(wide.as_ptr()))
+            .map_err(|e| AudioError::Com(e.to_string()))?;
+
+        let client: IAudioClient = device
+            .Activate(CLSCTX_ALL, None)
+            .map_err(|e| AudioError::Client(e.to_string()))?;
+
+        let format = client
+            .GetMixFormat()
+            .map_err(|e| AudioError::Client(e.to_string()))?;
+
+        let read = EndpointFormat {
+            sample_rate: (*format).nSamplesPerSec,
+            channels: (*format).nChannels,
+            bits_per_sample: (*format).wBitsPerSample,
+        };
+
+        // GetMixFormat hands ownership over; nothing else frees this.
+        CoTaskMemFree(Some(format as *const _));
+        Ok(read)
+    }
+}
+
+/// The endpoint Windows currently sends application audio to.
+///
+/// Needed to answer "is the cable actually receiving the music", which is a
+/// different question from "does the cable exist" and the one people get wrong.
+pub fn default_render_device() -> Result<AudioDevice> {
+    ensure_com()?;
+
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .map_err(|e| AudioError::Com(e.to_string()))?;
+
+        let device = enumerator
+            .GetDefaultAudioEndpoint(eRender, eConsole)
+            .map_err(|e| AudioError::Com(e.to_string()))?;
+
+        let name = device_name(&device).unwrap_or_default();
+        let id = device
+            .GetId()
+            .ok()
+            .and_then(|id| id.to_string().ok())
+            .unwrap_or_default();
+
+        Ok(AudioDevice { name, id })
+    }
 }
 
 pub fn find_cable_render_device(preferred_name: Option<&str>) -> Result<AudioDevice> {
@@ -297,6 +514,15 @@ pub struct AudioCapture {
     client: IAudioClient,
     capture: IAudioCaptureClient,
     sample_rate: u32,
+    /// The rate frames are handed out at, which need not be the device's.
+    ///
+    /// Windows decides an endpoint's shared-mode rate and will not be talked
+    /// out of it; the codec configuration decides ours. Requiring the two to
+    /// agree meant any preset below 48 kHz could not play at all - and
+    /// `build_with_fallback` can choose one of those on its own, so a headset
+    /// that refused 48 kHz produced a format error from the sound card rather
+    /// than anything about the headset.
+    target_rate: u32,
     channels: u16,
     bits_per_sample: u16,
     /// Whether samples are floating point rather than integers. Bit width alone
@@ -350,10 +576,10 @@ impl AudioCapture {
             let bits_per_sample = (*format).wBitsPerSample;
             let float_samples = format_is_float(format);
 
-            if expected_rate.is_some_and(|expected| sample_rate != expected)
-                || (require_stereo && channels != 2)
-                || channels == 0
-            {
+            // A rate difference is converted below, so only a channel layout
+            // this stack cannot use is fatal. Rejecting on rate alone is what
+            // made every non-48 kHz configuration unreachable.
+            if (require_stereo && channels != 2) || channels == 0 {
                 // GetMixFormat allocates with CoTaskMemAlloc and hands ownership to
                 // us. Returning early without freeing leaks it, and this path runs
                 // once per probed sample rate.
@@ -393,6 +619,7 @@ impl AudioCapture {
                 client,
                 capture,
                 sample_rate,
+                target_rate: expected_rate.unwrap_or(sample_rate),
                 channels,
                 bits_per_sample,
                 float_samples,
@@ -415,7 +642,16 @@ impl AudioCapture {
             format!("{}-bit integer", self.bits_per_sample)
         };
 
-        format!("{} Hz, {} channels, {sample}", self.sample_rate, self.channels)
+        if self.sample_rate == self.target_rate {
+            format!("{} Hz, {} channels, {sample}", self.sample_rate, self.channels)
+        } else {
+            // Printed rather than hidden: resampling is a real step in the
+            // chain, and someone judging the sound deserves to know it is there.
+            format!(
+                "{} Hz -> {} Hz, {} channels, {sample}",
+                self.sample_rate, self.target_rate, self.channels
+            )
+        }
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -509,13 +745,33 @@ impl AudioCapture {
         Ok(())
     }
 
+    /// Moves whatever the device has ready into the pending buffer.
+    ///
+    /// Exposed so a caller can let the capture build a head start before it
+    /// starts pacing to a deadline, without asking for a frame it is not ready
+    /// to send yet.
+    pub fn pump(&mut self) -> Result<()> {
+        self.drain_device()
+    }
+
     /// Returns exactly one LC3 frame worth of samples per channel, or None if the
     /// device has not produced enough yet.
     ///
     /// Returning None rather than a short frame matters: LC3 encodes fixed-size
     /// blocks, and a partial one would shift every later frame out of alignment.
     pub fn next_frame(&mut self, samples_per_channel: usize) -> Result<Option<Vec<i16>>> {
-        let needed = samples_per_channel * self.channels as usize;
+        // How many of the device's own frames make up one of ours. Rounded up,
+        // so the resampler is never asked to invent the tail of a frame.
+        let source_per_channel = if self.sample_rate == self.target_rate {
+            samples_per_channel
+        } else {
+            ((samples_per_channel as u64 * self.sample_rate as u64
+                + self.target_rate as u64
+                - 1)
+                / self.target_rate as u64) as usize
+        };
+
+        let needed = source_per_channel * self.channels as usize;
 
         if self.pending.len() < needed {
             self.drain_device()?;
@@ -526,7 +782,16 @@ impl AudioCapture {
         }
 
         let frame: Vec<i16> = self.pending.drain(..needed).collect();
-        Ok(Some(frame))
+
+        if self.sample_rate == self.target_rate {
+            return Ok(Some(frame));
+        }
+
+        Ok(Some(resample_interleaved(
+            &frame,
+            self.channels as usize,
+            samples_per_channel,
+        )))
     }
 
     /// Returns one mono monitoring frame at `output_rate`. All input channels
@@ -612,6 +877,15 @@ impl AudioCapture {
             return f32::NEG_INFINITY;
         }
 
+        // Above Nyquist there is nothing to measure: whatever the algorithm
+        // returns is an alias of a lower frequency, and reporting it would
+        // credit the stream with content it does not carry. This matters now
+        // that the top probe is 20 kHz - at a 32 kHz capture rate that is past
+        // the limit, and silently plausible numbers are worse than none.
+        if frequency * 2.0 >= rate as f32 {
+            return f32::NEG_INFINITY;
+        }
+
         let k = frequency / rate as f32;
         let coefficient = 2.0 * (2.0 * std::f32::consts::PI * k).cos();
 
@@ -657,10 +931,19 @@ impl AudioCapture {
             }
         };
 
+        // The top band reaches 20 kHz, which is where hearing stops and where a
+        // 48 kHz stream still has headroom - Nyquist is 24 kHz. Stopping the
+        // probes at 16 kHz meant the meter could not tell a stream that carried
+        // the top octave from one that had thrown it away, which is exactly the
+        // question someone asks when they suspect the treble is missing.
+        //
+        // The lowest probe is 20 Hz for the same reason at the other end.
+        // Probes are spaced so no band is decided by a single frequency: real
+        // music can have a null at any one of them.
         (
-            band(&[40.0, 64.0, 100.0, 160.0, 250.0]),
+            band(&[20.0, 32.0, 50.0, 80.0, 125.0, 200.0]),
             band(&[500.0, 800.0, 1_250.0, 2_000.0, 3_150.0]),
-            band(&[5_000.0, 8_000.0, 12_500.0, 16_000.0]),
+            band(&[5_000.0, 8_000.0, 12_500.0, 16_000.0, 18_000.0, 20_000.0]),
         )
     }
 
@@ -966,6 +1249,51 @@ mod tests {
 
         assert_eq!(left, vec![1, 2, 3]);
         assert_eq!(right, vec![-1, -2, -3]);
+    }
+
+    #[test]
+    fn resampling_keeps_the_channels_apart() {
+        // Left is a ramp, right is its negative. If the two ever mixed, the
+        // sum would stop being zero - which is exactly the failure that would
+        // otherwise be heard as the stereo image collapsing.
+        let source: Vec<i16> = (0..8i16).flat_map(|n| [n * 100, -n * 100]).collect();
+
+        let out = resample_interleaved(&source, 2, 4);
+
+        assert_eq!(out.len(), 8);
+        for pair in out.chunks_exact(2) {
+            assert_eq!(pair[0], -pair[1]);
+        }
+    }
+
+    #[test]
+    fn resampling_produces_exactly_the_frames_asked_for() {
+        // The encoder takes fixed-size blocks, so a frame that is one sample
+        // short shifts every later frame out of alignment.
+        let source: Vec<i16> = (0..100i16).flat_map(|n| [n, n]).collect();
+
+        for wanted in [1usize, 7, 64, 480] {
+            assert_eq!(resample_interleaved(&source, 2, wanted).len(), wanted * 2);
+        }
+    }
+
+    #[test]
+    fn resampling_spans_the_whole_input() {
+        // Both ends must line up, or consecutive frames leave a gap between
+        // them and the result clicks once per frame.
+        let source: Vec<i16> = (0..9i16).flat_map(|n| [n * 1000, n * 1000]).collect();
+
+        let out = resample_interleaved(&source, 2, 5);
+
+        assert_eq!(out[0], 0);
+        assert_eq!(out[out.len() - 2], 8000);
+    }
+
+    #[test]
+    fn resampling_an_empty_block_is_empty_rather_than_a_panic() {
+        assert!(resample_interleaved(&[], 2, 10).is_empty());
+        assert!(resample_interleaved(&[1, 2], 2, 0).is_empty());
+        assert!(resample_interleaved(&[1, 2], 0, 4).is_empty());
     }
 
     #[test]
