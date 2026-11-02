@@ -12,3 +12,8 @@ An earlier version of OpenLEAudio, created to make Windows Bluetooth LE Audio co
 Download the ZIP from Releases and follow the setup guide. The newer development line is [OpenLEAudio-v3](https://github.com/FajkPes/OpenLEAudio-v3).
 
 [Download a release](https://github.com/FajkPes/OpenLEAudio/releases) · [Detailed documentation](README-DETAILS.md)
+
+## Credits
+
+**Idea, concept and design:** FajkPes  
+**Coding:** ChatGPT Codex, Claude and Google Antigravity
