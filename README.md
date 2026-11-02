@@ -1,17 +1,21 @@
-# OpenLEAudio
+# OpenLEAudio — legacy version
 
-An earlier version of OpenLEAudio, created to make Windows Bluetooth LE Audio connections more configurable.
+This is the original OpenLEAudio project. For the newer version, visit [OpenLEAudio 4](https://github.com/FajkPes/OpenLEAudio-v4).
 
-## Key features
+OpenLEAudio was created to make Bluetooth LE Audio on Windows more configurable and to expose connection diagnostics. It runs a user-space audio stack using a dedicated USB Bluetooth adapter through WinUSB; another adapter can remain on the standard Windows stack.
 
-- Adjust audio and connection settings.
-- Inspect connection diagnostics and use a dedicated USB adapter.
+## Features
 
-## Get started
+- Configure audio and connection parameters, including codec, bitrate, PHY and latency.
+- Inspect connection status and diagnostics, and use automatic reconnection.
+- Use headset controls and available battery and signal information.
+- Restore the dedicated adapter to the Windows driver.
 
-Download the ZIP from Releases and follow the setup guide. The newer development line is [OpenLEAudio-v3](https://github.com/FajkPes/OpenLEAudio-v3).
+## Download and setup
 
-[Download a release](https://github.com/FajkPes/OpenLEAudio/releases) · [Detailed documentation](README-DETAILS.md)
+This repository contains the original 0.9 and 1.0 Windows releases. Download a ZIP from [Releases](https://github.com/FajkPes/OpenLEAudio/releases), extract it and run `START OpenLEAudio.bat`. The setup requires a compatible dedicated USB Bluetooth adapter and VB-CABLE. The reference hardware was a JBL TUNE 780NC and ASUS USB-BT600; compatibility with other devices is not guaranteed.
+
+The old 0.9 and 1.0 downloads and their source tags are also preserved in [OpenLEAudio 4 releases](https://github.com/FajkPes/OpenLEAudio-v4/releases). See the [detailed original documentation](README-DETAILS.md) for installation and configuration.
 
 ## Credits
 
